@@ -22,23 +22,6 @@ class WillhabenCarScraper:
     def __init__(self):
         self.base_url = "https://www.willhaben.at"
         
-    def _find_nix_binary(self, binary_name):
-        """Find binary in Nix store"""
-        # Try common Nix paths
-        nix_paths = [
-            f'/nix/store/*/{binary_name}',
-            f'/nix/store/*/bin/{binary_name}',
-        ]
-        
-        for pattern in nix_paths:
-            matches = glob_module.glob(pattern)
-            if matches:
-                # Sort to get the most recent version
-                matches.sort()
-                return matches[-1]
-        
-        return None
-    
     def _create_driver(self, headless=True):
         """Create and configure Chrome WebDriver"""
         chrome_options = Options()
@@ -56,89 +39,143 @@ class WillhabenCarScraper:
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36')
         
-        print("🔍 Searching for Chromium and ChromeDriver...")
+        print("🔍 Debugging - Looking for Chromium and ChromeDriver...")
+        print(f"   Current PATH: {os.environ.get('PATH', 'Not set')}")
+        
+        # Debug: List what's in common directories
+        print("\n📂 Checking common directories:")
+        for dir_path in ['/usr/bin', '/usr/local/bin', '/nix/store']:
+            if os.path.exists(dir_path):
+                print(f"   {dir_path} exists")
+                if dir_path == '/nix/store':
+                    try:
+                        # List directories in nix store
+                        items = os.listdir(dir_path)
+                        print(f"      Found {len(items)} items in /nix/store")
+                        # Look for chromium-related directories
+                        chromium_dirs = [item for item in items if 'chromium' in item.lower()]
+                        if chromium_dirs:
+                            print(f"      Chromium-related directories: {chromium_dirs[:5]}")
+                            for chrom_dir in chromium_dirs[:3]:
+                                full_path = os.path.join(dir_path, chrom_dir)
+                                if os.path.isdir(full_path):
+                                    try:
+                                        contents = os.listdir(full_path)
+                                        print(f"         {chrom_dir}: {contents}")
+                                    except:
+                                        pass
+                    except Exception as e:
+                        print(f"      Error listing: {e}")
+            else:
+                print(f"   {dir_path} does not exist")
+        
+        print("\n🔍 Searching for binaries...")
         
         # Find Chromium binary
         chromium_binary = None
         
-        # Method 1: Try to find in Nix store
-        chromium_binary = self._find_nix_binary('chromium')
-        if not chromium_binary:
-            chromium_binary = self._find_nix_binary('chromium-browser')
+        # Try which first (fastest)
+        print("   Trying 'which' command...")
+        for cmd in ['chromium', 'chromium-browser', 'google-chrome']:
+            result = shutil.which(cmd)
+            if result:
+                print(f"      Found via 'which {cmd}': {result}")
+                chromium_binary = result
+                break
         
-        # Method 2: Try which command
+        # Try glob in nix store
         if not chromium_binary:
-            chromium_binary = shutil.which('chromium')
-        if not chromium_binary:
-            chromium_binary = shutil.which('chromium-browser')
-        
-        # Method 3: Try common paths
-        if not chromium_binary:
-            common_paths = [
-                '/usr/bin/chromium',
-                '/usr/bin/chromium-browser',
+            print("   Searching /nix/store with glob...")
+            patterns = [
+                '/nix/store/*/bin/chromium',
+                '/nix/store/*/bin/chromium-browser',
+                '/nix/store/*-chromium-*/bin/chromium',
             ]
-            for path in common_paths:
-                if os.path.exists(path):
-                    chromium_binary = path
+            for pattern in patterns:
+                print(f"      Trying pattern: {pattern}")
+                matches = glob_module.glob(pattern)
+                if matches:
+                    matches.sort()
+                    chromium_binary = matches[-1]
+                    print(f"      ✅ Found: {chromium_binary}")
                     break
         
+        # Try subprocess find (slower but thorough)
+        if not chromium_binary:
+            print("   Trying 'find' command in /nix/store...")
+            try:
+                result = subprocess.run(
+                    ['find', '/nix/store', '-name', 'chromium', '-type', 'f', '-executable'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.stdout.strip():
+                    lines = result.stdout.strip().split('\n')
+                    print(f"      Found {len(lines)} matches")
+                    for line in lines[:5]:
+                        print(f"         {line}")
+                    chromium_binary = lines[0]
+            except Exception as e:
+                print(f"      Find command failed: {e}")
+        
         if chromium_binary:
-            print(f"✅ Found Chromium at: {chromium_binary}")
+            print(f"\n✅ Found Chromium at: {chromium_binary}")
             chrome_options.binary_location = chromium_binary
         else:
-            print("❌ ERROR: Could not find Chromium binary!")
-            print("   Searching in /nix/store...")
-            try:
-                result = subprocess.run(['find', '/nix/store', '-name', 'chromium', '-type', 'f'], 
-                                      capture_output=True, text=True, timeout=5)
-                print(f"   Find results:\n{result.stdout}")
-            except:
-                pass
+            print("\n❌ ERROR: Could not find Chromium binary!")
         
         # Find ChromeDriver
         chromedriver_binary = None
         
-        # Method 1: Try to find in Nix store
-        chromedriver_binary = self._find_nix_binary('chromedriver')
+        print("\n🔍 Searching for ChromeDriver...")
         
-        # Method 2: Try which command
-        if not chromedriver_binary:
-            chromedriver_binary = shutil.which('chromedriver')
+        # Try which first
+        result = shutil.which('chromedriver')
+        if result:
+            print(f"   Found via 'which': {result}")
+            chromedriver_binary = result
         
-        # Method 3: Try common paths
+        # Try glob in nix store
         if not chromedriver_binary:
-            common_paths = [
-                '/usr/bin/chromedriver',
-                '/usr/local/bin/chromedriver',
+            patterns = [
+                '/nix/store/*/bin/chromedriver',
+                '/nix/store/*-chromedriver-*/bin/chromedriver',
             ]
-            for path in common_paths:
-                if os.path.exists(path):
-                    chromedriver_binary = path
+            for pattern in patterns:
+                matches = glob_module.glob(pattern)
+                if matches:
+                    matches.sort()
+                    chromedriver_binary = matches[-1]
+                    print(f"   Found via glob: {chromedriver_binary}")
                     break
+        
+        # Try find command
+        if not chromedriver_binary:
+            try:
+                result = subprocess.run(
+                    ['find', '/nix/store', '-name', 'chromedriver', '-type', 'f', '-executable'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.stdout.strip():
+                    lines = result.stdout.strip().split('\n')
+                    chromedriver_binary = lines[0]
+                    print(f"   Found via find: {chromedriver_binary}")
+            except:
+                pass
         
         if chromedriver_binary:
             print(f"✅ Found ChromeDriver at: {chromedriver_binary}")
         else:
-            print("❌ ERROR: Could not find ChromeDriver binary!")
-            print("   Searching in /nix/store...")
-            try:
-                result = subprocess.run(['find', '/nix/store', '-name', 'chromedriver', '-type', 'f'], 
-                                      capture_output=True, text=True, timeout=5)
-                print(f"   Find results:\n{result.stdout}")
-            except:
-                pass
+            print("❌ Could not find ChromeDriver")
         
         import warnings
         warnings.filterwarnings('ignore')
-        
         os.environ['WDM_LOG'] = '0'
         
-        print("🚀 Attempting to start Chrome...")
+        print("\n🚀 Attempting to start Chrome...")
         
-        # Make sure we found both binaries
+        # Make sure we found chromium
         if not chromium_binary:
-            raise Exception("Chromium binary not found. Check nixpacks.toml configuration.")
+            raise Exception("Chromium binary not found. Check nixpacks.toml configuration and logs above.")
         
         try:
             if chromedriver_binary:
@@ -156,24 +193,6 @@ class WillhabenCarScraper:
             print(f"❌ Failed to start Chrome: {str(e)}")
             import traceback
             traceback.print_exc()
-            
-            # Additional debugging
-            print("\n🔍 Debug info:")
-            print(f"   Chromium binary: {chromium_binary}")
-            print(f"   ChromeDriver binary: {chromedriver_binary}")
-            print(f"   PATH: {os.environ.get('PATH', 'Not set')}")
-            
-            # Try to get more info about the chromedriver
-            if chromedriver_binary:
-                print(f"\n   Testing ChromeDriver executable...")
-                try:
-                    result = subprocess.run([chromedriver_binary, '--version'], 
-                                          capture_output=True, text=True, timeout=5)
-                    print(f"   ChromeDriver version: {result.stdout}")
-                    print(f"   ChromeDriver stderr: {result.stderr}")
-                except Exception as e2:
-                    print(f"   Failed to run ChromeDriver: {e2}")
-            
             raise Exception(f"Could not start Chrome. Error: {str(e)}")
     
     def search_cars(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
@@ -428,7 +447,7 @@ def home():
     """API documentation"""
     return jsonify({
         'name': 'Willhaben Car Scraper API',
-        'version': '7.1',
+        'version': '7.2-debug',
         'description': 'Extracts essential car info and ALL images from any listing',
         'endpoints': {
             '/api/search': {
@@ -531,14 +550,14 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'Willhaben Car Scraper API',
-        'version': '7.1'
+        'version': '7.2-debug'
     })
 
 if __name__ == '__main__':
     import os
     
     print("=" * 80)
-    print("🚗 Willhaben Car Scraper API")
+    print("🚗 Willhaben Car Scraper API v7.2-debug")
     print("=" * 80)
     print("\n✨ Features:")
     print("   📋 Essential car information (brand, model, year, price, etc.)")
