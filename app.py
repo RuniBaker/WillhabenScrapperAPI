@@ -1,208 +1,46 @@
 from flask import Flask, jsonify, request
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 import time
 import re
 from typing import List, Dict, Optional
 import json
-import os
-import shutil
-import glob as glob_module
-import subprocess
+import asyncio
+from playwright.async_api import async_playwright
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
 
 class WillhabenCarScraper:
     """
-    Streamlined Willhaben scraper - extracts essential car info and ALL images
+    Streamlined Willhaben scraper using Playwright - extracts essential car info and ALL images
     """
     def __init__(self):
         self.base_url = "https://www.willhaben.at"
-        
-    def _create_driver(self, headless=True):
-        """Create and configure Chrome WebDriver"""
-        chrome_options = Options()
-        
-        if headless:
-            chrome_options.add_argument('--headless=new')
-        
-        # Essential options
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--disable-software-rasterizer')
-        chrome_options.add_argument('--disable-extensions')
-        chrome_options.add_argument('--disable-setuid-sandbox')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36')
-        
-        print("🔍 Debugging - Looking for Chromium and ChromeDriver...")
-        print(f"   Current PATH: {os.environ.get('PATH', 'Not set')}")
-        
-        # Debug: List what's in common directories
-        print("\n📂 Checking common directories:")
-        for dir_path in ['/usr/bin', '/usr/local/bin', '/nix/store']:
-            if os.path.exists(dir_path):
-                print(f"   {dir_path} exists")
-                if dir_path == '/nix/store':
-                    try:
-                        # List directories in nix store
-                        items = os.listdir(dir_path)
-                        print(f"      Found {len(items)} items in /nix/store")
-                        # Look for chromium-related directories
-                        chromium_dirs = [item for item in items if 'chromium' in item.lower()]
-                        if chromium_dirs:
-                            print(f"      Chromium-related directories: {chromium_dirs[:5]}")
-                            for chrom_dir in chromium_dirs[:3]:
-                                full_path = os.path.join(dir_path, chrom_dir)
-                                if os.path.isdir(full_path):
-                                    try:
-                                        contents = os.listdir(full_path)
-                                        print(f"         {chrom_dir}: {contents}")
-                                    except:
-                                        pass
-                    except Exception as e:
-                        print(f"      Error listing: {e}")
-            else:
-                print(f"   {dir_path} does not exist")
-        
-        print("\n🔍 Searching for binaries...")
-        
-        # Find Chromium binary
-        chromium_binary = None
-        
-        # Try which first (fastest)
-        print("   Trying 'which' command...")
-        for cmd in ['chromium', 'chromium-browser', 'google-chrome']:
-            result = shutil.which(cmd)
-            if result:
-                print(f"      Found via 'which {cmd}': {result}")
-                chromium_binary = result
-                break
-        
-        # Try glob in nix store
-        if not chromium_binary:
-            print("   Searching /nix/store with glob...")
-            patterns = [
-                '/nix/store/*/bin/chromium',
-                '/nix/store/*/bin/chromium-browser',
-                '/nix/store/*-chromium-*/bin/chromium',
-            ]
-            for pattern in patterns:
-                print(f"      Trying pattern: {pattern}")
-                matches = glob_module.glob(pattern)
-                if matches:
-                    matches.sort()
-                    chromium_binary = matches[-1]
-                    print(f"      ✅ Found: {chromium_binary}")
-                    break
-        
-        # Try subprocess find (slower but thorough)
-        if not chromium_binary:
-            print("   Trying 'find' command in /nix/store...")
-            try:
-                result = subprocess.run(
-                    ['find', '/nix/store', '-name', 'chromium', '-type', 'f', '-executable'],
-                    capture_output=True, text=True, timeout=10
-                )
-                if result.stdout.strip():
-                    lines = result.stdout.strip().split('\n')
-                    print(f"      Found {len(lines)} matches")
-                    for line in lines[:5]:
-                        print(f"         {line}")
-                    chromium_binary = lines[0]
-            except Exception as e:
-                print(f"      Find command failed: {e}")
-        
-        if chromium_binary:
-            print(f"\n✅ Found Chromium at: {chromium_binary}")
-            chrome_options.binary_location = chromium_binary
-        else:
-            print("\n❌ ERROR: Could not find Chromium binary!")
-        
-        # Find ChromeDriver
-        chromedriver_binary = None
-        
-        print("\n🔍 Searching for ChromeDriver...")
-        
-        # Try which first
-        result = shutil.which('chromedriver')
-        if result:
-            print(f"   Found via 'which': {result}")
-            chromedriver_binary = result
-        
-        # Try glob in nix store
-        if not chromedriver_binary:
-            patterns = [
-                '/nix/store/*/bin/chromedriver',
-                '/nix/store/*-chromedriver-*/bin/chromedriver',
-            ]
-            for pattern in patterns:
-                matches = glob_module.glob(pattern)
-                if matches:
-                    matches.sort()
-                    chromedriver_binary = matches[-1]
-                    print(f"   Found via glob: {chromedriver_binary}")
-                    break
-        
-        # Try find command
-        if not chromedriver_binary:
-            try:
-                result = subprocess.run(
-                    ['find', '/nix/store', '-name', 'chromedriver', '-type', 'f', '-executable'],
-                    capture_output=True, text=True, timeout=10
-                )
-                if result.stdout.strip():
-                    lines = result.stdout.strip().split('\n')
-                    chromedriver_binary = lines[0]
-                    print(f"   Found via find: {chromedriver_binary}")
-            except:
-                pass
-        
-        if chromedriver_binary:
-            print(f"✅ Found ChromeDriver at: {chromedriver_binary}")
-        else:
-            print("❌ Could not find ChromeDriver")
-        
-        import warnings
-        warnings.filterwarnings('ignore')
-        os.environ['WDM_LOG'] = '0'
-        
-        print("\n🚀 Attempting to start Chrome...")
-        
-        # Make sure we found chromium
-        if not chromium_binary:
-            raise Exception("Chromium binary not found. Check nixpacks.toml configuration and logs above.")
-        
-        try:
-            if chromedriver_binary:
-                print(f"   Using ChromeDriver at: {chromedriver_binary}")
-                service = Service(executable_path=chromedriver_binary)
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-            else:
-                print("   Trying without explicit ChromeDriver path...")
-                driver = webdriver.Chrome(options=chrome_options)
-            
-            print("✅ Chrome started successfully")
-            return driver
-            
-        except Exception as e:
-            print(f"❌ Failed to start Chrome: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise Exception(f"Could not start Chrome. Error: {str(e)}")
     
-    def search_cars(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
-        """Search for cars on Willhaben"""
-        driver = None
+    async def _create_browser(self):
+        """Create and configure Playwright browser"""
+        print("🚀 Starting Playwright browser...")
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+            ]
+        )
+        return playwright, browser
+    
+    async def _search_cars_async(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
+        """Search for cars on Willhaben (async)"""
+        playwright = None
+        browser = None
         try:
             print(f"🔍 Searching: {keyword or 'all cars'}")
             print(f"📊 Max results: {max_results}")
             
-            driver = self._create_driver(headless=True)
+            playwright, browser = await self._create_browser()
+            page = await browser.new_page()
             
             search_url = f"{self.base_url}/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
             params = []
@@ -219,13 +57,13 @@ class WillhabenCarScraper:
                 search_url += "?" + "&".join(params)
             
             print(f"📡 URL: {search_url}")
-            driver.get(search_url)
+            await page.goto(search_url, wait_until='networkidle')
             print("⏳ Waiting for page load...")
-            time.sleep(3)
+            await asyncio.sleep(3)
             
             print("📦 Extracting data...")
-            page_source = driver.page_source
-            json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_source, re.DOTALL)
+            page_content = await page.content()
+            json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_content, re.DOTALL)
             
             if not json_match:
                 print("❌ Could not find __NEXT_DATA__ in page")
@@ -255,9 +93,15 @@ class WillhabenCarScraper:
             traceback.print_exc()
             return []
         finally:
-            if driver:
+            if browser:
                 print("🔒 Closing browser...")
-                driver.quit()
+                await browser.close()
+            if playwright:
+                await playwright.stop()
+    
+    def search_cars(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
+        """Search for cars on Willhaben (sync wrapper)"""
+        return asyncio.run(self._search_cars_async(keyword, max_results, min_price, max_price))
     
     def _parse_listing_from_json(self, listing: Dict) -> Optional[Dict]:
         """Parse basic listing info from search results"""
@@ -293,7 +137,6 @@ class WillhabenCarScraper:
             images = listing.get('advertImageList', {}).get('advertImage', [])
             if images:
                 first_image = images[0]
-                # Use mainImageUrl for best quality, fallback to others
                 car_data['thumbnail'] = (
                     first_image.get('mainImageUrl') or 
                     first_image.get('referenceImageUrl') or 
@@ -305,23 +148,22 @@ class WillhabenCarScraper:
         except Exception as e:
             return None
     
-    def get_car_details(self, listing_id: str) -> Dict:
-        """
-        Get essential car details and ALL images for any listing
-        """
-        driver = None
+    async def _get_car_details_async(self, listing_id: str) -> Dict:
+        """Get essential car details and ALL images for any listing (async)"""
+        playwright = None
+        browser = None
         try:
             print(f"🔍 Fetching details for listing: {listing_id}")
-            driver = self._create_driver(headless=True)
+            playwright, browser = await self._create_browser()
+            page = await browser.new_page()
             
-            # Try to fetch the page
             url = f"{self.base_url}/iad/gebrauchtwagen/d/auto/listing-{listing_id}"
             print(f"📡 URL: {url}")
-            driver.get(url)
-            time.sleep(4)
+            await page.goto(url, wait_until='networkidle')
+            await asyncio.sleep(4)
             
-            page_source = driver.page_source
-            json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_source, re.DOTALL)
+            page_content = await page.content()
+            json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_content, re.DOTALL)
             
             if not json_match:
                 return {'error': 'Could not find listing data', 'listing_id': listing_id}
@@ -412,7 +254,6 @@ class WillhabenCarScraper:
             image_list = advert.get('advertImageList', {}).get('advertImage', [])
             
             for img in image_list:
-                # Get the highest quality image available
                 img_url = img.get('mainImageUrl') or img.get('referenceImageUrl') or img.get('thumbnailImageUrl')
                 
                 if img_url and img_url not in car_data['images']:
@@ -433,8 +274,14 @@ class WillhabenCarScraper:
             traceback.print_exc()
             return {'error': str(e), 'listing_id': listing_id}
         finally:
-            if driver:
-                driver.quit()
+            if browser:
+                await browser.close()
+            if playwright:
+                await playwright.stop()
+    
+    def get_car_details(self, listing_id: str) -> Dict:
+        """Get car details (sync wrapper)"""
+        return asyncio.run(self._get_car_details_async(listing_id))
 
 
 # Initialize scraper
@@ -447,7 +294,7 @@ def home():
     """API documentation"""
     return jsonify({
         'name': 'Willhaben Car Scraper API',
-        'version': '7.2-debug',
+        'version': '8.0 (Playwright)',
         'description': 'Extracts essential car info and ALL images from any listing',
         'endpoints': {
             '/api/search': {
@@ -550,20 +397,21 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'Willhaben Car Scraper API',
-        'version': '7.2-debug'
+        'version': '8.0 (Playwright)'
     })
 
 if __name__ == '__main__':
     import os
     
     print("=" * 80)
-    print("🚗 Willhaben Car Scraper API v7.2-debug")
+    print("🚗 Willhaben Car Scraper API v8.0 (Playwright)")
     print("=" * 80)
     print("\n✨ Features:")
     print("   📋 Essential car information (brand, model, year, price, etc.)")
     print("   📍 Complete address (street, postal code, city, country)")
     print("   📸 ALL images from any listing")
     print("   🔢 Works with ANY listing ID")
+    print("   🎭 Powered by Playwright (easier deployment)")
     print("\n📋 Endpoints:")
     print("   • /")
     print("   • /api/search?keyword=BMW")
