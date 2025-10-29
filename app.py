@@ -25,75 +25,45 @@ class WillhabenCarScraper:
         if headless:
             chrome_options.add_argument('--headless=new')
         
+        # Essential options
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        
-        # Additional options for Railway/Cloud environments
-        chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--disable-software-rasterizer')
+        chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--disable-setuid-sandbox')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36')
         
         import warnings
         warnings.filterwarnings('ignore')
         
+        import os
+        os.environ['WDM_LOG'] = '0'
+        
+        print("🚀 Attempting to start Chrome...")
+        
+        # Try multiple approaches
         try:
-            import os
-            os.environ['WDM_LOG'] = '0'
-            
-            print("🚀 Starting Chrome...")
-            
-            # Try to find chromium (Railway) or chrome
-            chrome_binary = None
-            possible_paths = [
-                '/nix/store/*/bin/chromium',  # Railway/Nix
-                '/usr/bin/chromium',
-                '/usr/bin/chromium-browser',
-                '/usr/bin/google-chrome',
-                '/usr/bin/google-chrome-stable'
-            ]
-            
-            import glob
-            for path_pattern in possible_paths:
-                matches = glob.glob(path_pattern)
-                if matches:
-                    chrome_binary = matches[0]
-                    print(f"✅ Found Chrome at: {chrome_binary}")
-                    break
-            
-            if chrome_binary:
-                chrome_options.binary_location = chrome_binary
-            
+            # Approach 1: Direct Chrome
+            print("   Trying direct Chrome...")
             driver = webdriver.Chrome(options=chrome_options)
             print("✅ Chrome started successfully")
             return driver
+        except Exception as e1:
+            print(f"   ❌ Direct Chrome failed: {str(e1)[:100]}")
             
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ Chrome startup error: {error_msg}")
-            
-            if 'version' in error_msg.lower() or 'driver' in error_msg.lower():
-                print("⚠️ Trying to download matching ChromeDriver...")
-                try:
-                    import shutil
-                    cache_dir = os.path.expanduser('~/.wdm')
-                    if os.path.exists(cache_dir):
-                        shutil.rmtree(cache_dir)
-                    
-                    from webdriver_manager.chrome import ChromeDriverManager
-                    service = Service(ChromeDriverManager().install())
-                    driver = webdriver.Chrome(service=service, options=chrome_options)
-                    print("✅ Chrome started with auto-downloaded driver")
-                    return driver
-                except Exception as e2:
-                    raise Exception(f"Could not start Chrome: {e2}")
-            else:
-                raise Exception(f"Could not start Chrome: {e}")
+            try:
+                # Approach 2: With webdriver-manager
+                print("   Trying webdriver-manager...")
+                from webdriver_manager.chrome import ChromeDriverManager
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                print("✅ Chrome started with webdriver-manager")
+                return driver
+            except Exception as e2:
+                print(f"   ❌ Webdriver-manager failed: {str(e2)[:100]}")
+                raise Exception(f"Could not start Chrome. Make sure Chrome/Chromium is installed. Errors: {str(e1)[:50]}, {str(e2)[:50]}")
     
     def search_cars(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
         """Search for cars on Willhaben"""
