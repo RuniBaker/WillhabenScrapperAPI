@@ -7,6 +7,8 @@ import time
 import re
 from typing import List, Dict, Optional
 import json
+import os
+import shutil
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
@@ -35,35 +37,74 @@ class WillhabenCarScraper:
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36')
         
+        # Find Chromium binary
+        chromium_paths = [
+            '/nix/store/*/bin/chromium',  # Nix store path
+            shutil.which('chromium'),
+            shutil.which('chromium-browser'),
+        ]
+        
+        chromium_binary = None
+        for path in chromium_paths:
+            if path and '*' not in path and os.path.exists(path):
+                chromium_binary = path
+                break
+            elif path and '*' in path:
+                # Handle glob pattern for nix store
+                import glob
+                matches = glob.glob(path)
+                if matches:
+                    chromium_binary = matches[0]
+                    break
+        
+        if chromium_binary:
+            print(f"✅ Found Chromium at: {chromium_binary}")
+            chrome_options.binary_location = chromium_binary
+        else:
+            print("⚠️  Chromium binary not explicitly set, using system default")
+        
+        # Find ChromeDriver
+        chromedriver_paths = [
+            '/nix/store/*/bin/chromedriver',  # Nix store path
+            shutil.which('chromedriver'),
+        ]
+        
+        chromedriver_binary = None
+        for path in chromedriver_paths:
+            if path and '*' not in path and os.path.exists(path):
+                chromedriver_binary = path
+                break
+            elif path and '*' in path:
+                import glob
+                matches = glob.glob(path)
+                if matches:
+                    chromedriver_binary = matches[0]
+                    break
+        
         import warnings
         warnings.filterwarnings('ignore')
         
-        import os
         os.environ['WDM_LOG'] = '0'
         
         print("🚀 Attempting to start Chrome...")
         
-        # Try multiple approaches
         try:
-            # Approach 1: Direct Chrome
-            print("   Trying direct Chrome...")
-            driver = webdriver.Chrome(options=chrome_options)
+            if chromedriver_binary:
+                print(f"   Using ChromeDriver at: {chromedriver_binary}")
+                service = Service(executable_path=chromedriver_binary)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+            else:
+                print("   Using system ChromeDriver...")
+                driver = webdriver.Chrome(options=chrome_options)
+            
             print("✅ Chrome started successfully")
             return driver
-        except Exception as e1:
-            print(f"   ❌ Direct Chrome failed: {str(e1)[:100]}")
             
-            try:
-                # Approach 2: With webdriver-manager
-                print("   Trying webdriver-manager...")
-                from webdriver_manager.chrome import ChromeDriverManager
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-                print("✅ Chrome started with webdriver-manager")
-                return driver
-            except Exception as e2:
-                print(f"   ❌ Webdriver-manager failed: {str(e2)[:100]}")
-                raise Exception(f"Could not start Chrome. Make sure Chrome/Chromium is installed. Errors: {str(e1)[:50]}, {str(e2)[:50]}")
+        except Exception as e:
+            print(f"❌ Failed to start Chrome: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise Exception(f"Could not start Chrome. Make sure Chrome/Chromium is installed. Error: {str(e)}")
     
     def search_cars(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
         """Search for cars on Willhaben"""
@@ -231,20 +272,14 @@ class WillhabenCarScraper:
             
             # Extract attributes
             attributes = advert.get('attributes', {}).get('attribute', [])
-            
             for attr in attributes:
-                name = attr.get('name', '')
+                name = attr.get('name')
                 values = attr.get('values', [])
+                value = values[0] if values else None
                 
-                if not values:
-                    continue
-                
-                value = values[0]
-                
-                # Basic car info
-                if name == 'CAR_MODEL/MAKE':
+                if name == 'MAKE':
                     car_data['brand'] = value
-                elif name == 'CAR_MODEL/MODEL':
+                elif name == 'MODEL':
                     car_data['model'] = value
                 elif name == 'BODYTYPE':
                     car_data['car_type'] = value
