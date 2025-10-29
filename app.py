@@ -34,6 +34,11 @@ class WillhabenCarScraper:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
+        # Additional options for Railway/Cloud environments
+        chrome_options.add_argument('--disable-extensions')
+        chrome_options.add_argument('--disable-software-rasterizer')
+        chrome_options.add_argument('--disable-setuid-sandbox')
+        
         import warnings
         warnings.filterwarnings('ignore')
         
@@ -42,13 +47,38 @@ class WillhabenCarScraper:
             os.environ['WDM_LOG'] = '0'
             
             print("🚀 Starting Chrome...")
+            
+            # Try to find chromium (Railway) or chrome
+            chrome_binary = None
+            possible_paths = [
+                '/nix/store/*/bin/chromium',  # Railway/Nix
+                '/usr/bin/chromium',
+                '/usr/bin/chromium-browser',
+                '/usr/bin/google-chrome',
+                '/usr/bin/google-chrome-stable'
+            ]
+            
+            import glob
+            for path_pattern in possible_paths:
+                matches = glob.glob(path_pattern)
+                if matches:
+                    chrome_binary = matches[0]
+                    print(f"✅ Found Chrome at: {chrome_binary}")
+                    break
+            
+            if chrome_binary:
+                chrome_options.binary_location = chrome_binary
+            
             driver = webdriver.Chrome(options=chrome_options)
             print("✅ Chrome started successfully")
             return driver
+            
         except Exception as e:
             error_msg = str(e)
-            if 'version' in error_msg.lower():
-                print("⚠️ ChromeDriver version mismatch - trying auto-install...")
+            print(f"❌ Chrome startup error: {error_msg}")
+            
+            if 'version' in error_msg.lower() or 'driver' in error_msg.lower():
+                print("⚠️ Trying to download matching ChromeDriver...")
                 try:
                     import shutil
                     cache_dir = os.path.expanduser('~/.wdm')
@@ -70,6 +100,8 @@ class WillhabenCarScraper:
         driver = None
         try:
             print(f"🔍 Searching: {keyword or 'all cars'}")
+            print(f"📊 Max results: {max_results}")
+            
             driver = self._create_driver(headless=True)
             
             search_url = f"{self.base_url}/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
@@ -88,14 +120,18 @@ class WillhabenCarScraper:
             
             print(f"📡 URL: {search_url}")
             driver.get(search_url)
+            print("⏳ Waiting for page load...")
             time.sleep(3)
             
+            print("📦 Extracting data...")
             page_source = driver.page_source
             json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_source, re.DOTALL)
             
             if not json_match:
+                print("❌ Could not find __NEXT_DATA__ in page")
                 return []
             
+            print("✅ Found JSON data")
             next_data = json.loads(json_match.group(1))
             page_props = next_data['props']['pageProps']
             search_result = page_props.get('searchResult', {})
@@ -108,14 +144,19 @@ class WillhabenCarScraper:
                 car_data = self._parse_listing_from_json(listing)
                 if car_data:
                     cars.append(car_data)
+                    print(f"  ✓ {car_data['name'][:40]}...")
             
+            print(f"✅ Successfully parsed {len(cars)} cars")
             return cars
             
         except Exception as e:
-            print(f"❌ Error: {str(e)}")
+            print(f"❌ ERROR in search_cars: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return []
         finally:
             if driver:
+                print("🔒 Closing browser...")
                 driver.quit()
     
     def _parse_listing_from_json(self, listing: Dict) -> Optional[Dict]:
@@ -351,30 +392,49 @@ def home():
 @app.route('/api/search', methods=['GET'])
 def search_cars():
     """Search for cars"""
-    keyword = request.args.get('keyword', '')
-    max_results = int(request.args.get('max_results', 20))
-    min_price = request.args.get('min_price', type=int)
-    max_price = request.args.get('max_price', type=int)
-    
-    if max_results > 100:
-        max_results = 100
-    
-    print(f"\n{'='*60}")
-    print(f"🔍 Search: {keyword or 'all cars'} (max {max_results})")
-    print(f"{'='*60}\n")
-    
-    results = scraper.search_cars(
-        keyword=keyword,
-        max_results=max_results,
-        min_price=min_price,
-        max_price=max_price
-    )
-    
-    return jsonify({
-        'success': True,
-        'count': len(results),
-        'results': results
-    })
+    try:
+        keyword = request.args.get('keyword', '')
+        max_results = int(request.args.get('max_results', 20))
+        min_price = request.args.get('min_price', type=int)
+        max_price = request.args.get('max_price', type=int)
+        
+        if max_results > 100:
+            max_results = 100
+        
+        print(f"\n{'='*60}")
+        print(f"🔍 Search Request: {keyword or 'all cars'} (max {max_results})")
+        print(f"{'='*60}\n")
+        
+        results = scraper.search_cars(
+            keyword=keyword,
+            max_results=max_results,
+            min_price=min_price,
+            max_price=max_price
+        )
+        
+        if results is None:
+            results = []
+        
+        response = {
+            'success': len(results) > 0,
+            'count': len(results),
+            'results': results
+        }
+        
+        if len(results) == 0:
+            response['message'] = 'No results found or error occurred. Check server logs.'
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        print(f"❌ ERROR in search endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'An error occurred while searching. Please try again.'
+        }), 500
 
 @app.route('/api/car/<listing_id>', methods=['GET'])
 def get_car_details(listing_id):
