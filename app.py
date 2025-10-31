@@ -560,7 +560,85 @@ def trigger_scrape():
         logger.error(f"Error triggering scrape: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
+@app.route('/api/test-scrape', methods=['GET'])
+def test_scrape():
+    """Test scraping endpoint with detailed logging"""
+    try:
+        from playwright.sync_api import sync_playwright
+        
+        results = {
+            'status': 'running',
+            'steps': [],
+            'errors': []
+        }
+        
+        # Get custom URL from query param or use default
+        url = request.args.get('url', 'https://www.willhaben.at/iad/kaufen-und-verkaufen/auto')
+        results['url'] = url
+        
+        with sync_playwright() as p:
+            results['steps'].append('Playwright started')
+            
+            browser = p.chromium.launch(headless=True)
+            results['steps'].append('Browser launched')
+            
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            page = context.new_page()
+            results['steps'].append('Page created')
+            
+            # Navigate
+            results['steps'].append(f'Navigating to {url}')
+            response = page.goto(url, wait_until='networkidle', timeout=30000)
+            results['steps'].append(f'Navigation complete - Status: {response.status}')
+            
+            # Wait a bit
+            page.wait_for_timeout(3000)
+            results['steps'].append('Waited 3 seconds')
+            
+            # Get page title
+            title = page.title()
+            results['page_title'] = title
+            results['steps'].append(f'Page title: {title}')
+            
+            # Try to find listings with different selectors
+            selectors_to_try = [
+                '[data-testid="search-result-entry"]',
+                '.search-result-entry',
+                'article',
+                '[class*="SearchResult"]',
+                '[class*="search"]',
+                'a[href*="/iad/"]'
+            ]
+            
+            for selector in selectors_to_try:
+                count = page.locator(selector).count()
+                results['steps'].append(f'Selector "{selector}": {count} elements found')
+            
+            # Get page content sample (first 500 chars)
+            content = page.content()
+            results['html_sample'] = content[:500]
+            results['html_length'] = len(content)
+            
+            # Take a screenshot (base64)
+            screenshot = page.screenshot()
+            import base64
+            results['screenshot_base64'] = base64.b64encode(screenshot).decode('utf-8')
+            
+            browser.close()
+            results['steps'].append('Browser closed')
+        
+        results['status'] = 'completed'
+        return jsonify(results), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'failed',
+            'error': str(e),
+            'error_type': type(e).__name__
+        }), 500
 # ============================================================================
 # SCHEDULER SETUP
 # ============================================================================
