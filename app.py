@@ -1,426 +1,631 @@
+# app.py
+import os
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any
+import pytz
+
 from flask import Flask, jsonify, request
-import time
-import re
-from typing import List, Dict, Optional
-import json
-import asyncio
-from playwright.async_api import async_playwright
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import or_, and_, func
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+import atexit
 
+# Import your existing Playwright scraper logic
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Flask app
 app = Flask(__name__)
-app.config['JSON_AS_ASCII'] = False
 
-class WillhabenCarScraper:
-    """
-    Streamlined Willhaben scraper using Playwright - extracts essential car info and ALL images
-    """
-    def __init__(self):
-        self.base_url = "https://www.willhaben.at"
+# Database configuration
+DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://localhost/carscraper')
+# Fix for Railway PostgreSQL URL (postgres:// -> postgresql://)
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+}
+
+db = SQLAlchemy(app)
+
+# Timezone for CET
+CET = pytz.timezone('Europe/Vienna')
+
+# ============================================================================
+# DATABASE MODELS
+# ============================================================================
+
+class Car(db.Model):
+    __tablename__ = 'cars'
     
-    async def _create_browser(self):
-        """Create and configure Playwright browser"""
-        print("🚀 Starting Playwright browser...")
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-            ]
-        )
-        return playwright, browser
+    id = db.Column(db.Integer, primary_key=True)
+    listing_id = db.Column(db.String(100), unique=True, nullable=False, index=True)
+    title = db.Column(db.String(500), nullable=False)
+    price = db.Column(db.Numeric(10, 2))
+    currency = db.Column(db.String(10), default='EUR')
+    brand = db.Column(db.String(100), index=True)
+    model = db.Column(db.String(100))
+    year = db.Column(db.Integer)
+    mileage = db.Column(db.Integer)
+    fuel_type = db.Column(db.String(50))
+    transmission = db.Column(db.String(50))
+    location = db.Column(db.String(200))
+    image_url = db.Column(db.Text)
+    url = db.Column(db.Text, nullable=False)
+    description = db.Column(db.Text)
+    first_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    async def _search_cars_async(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
-        """Search for cars on Willhaben (async)"""
-        playwright = None
-        browser = None
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary for API responses"""
+        return {
+            'id': self.id,
+            'listing_id': self.listing_id,
+            'title': self.title,
+            'price': float(self.price) if self.price else None,
+            'currency': self.currency,
+            'brand': self.brand,
+            'model': self.model,
+            'year': self.year,
+            'mileage': self.mileage,
+            'fuel_type': self.fuel_type,
+            'transmission': self.transmission,
+            'location': self.location,
+            'image_url': self.image_url,
+            'url': self.url,
+            'description': self.description,
+            'first_seen_at': self.first_seen_at.isoformat() if self.first_seen_at else None,
+            'last_seen_at': self.last_seen_at.isoformat() if self.last_seen_at else None,
+            'is_active': self.is_active,
+        }
+
+
+class ScrapingLog(db.Model):
+    __tablename__ = 'scraping_log'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    scrape_started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    scrape_completed_at = db.Column(db.DateTime)
+    cars_found = db.Column(db.Integer, default=0)
+    cars_added = db.Column(db.Integer, default=0)
+    cars_updated = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(50))
+    error_message = db.Column(db.Text)
+
+
+# ============================================================================
+# SCRAPER CLASS
+# ============================================================================
+
+class WillhabenScraper:
+    """Scraper for willhaben.at car listings"""
+    
+    BASE_URL = "https://www.willhaben.at/iad/kaufen-und-verkaufen/auto"
+    
+    def __init__(self, max_cars: int = 100):
+        self.max_cars = max_cars
+    
+    def scrape_listings(self) -> List[Dict[str, Any]]:
+        """
+        Scrape car listings from willhaben.at
+        Returns list of car dictionaries
+        """
+        cars = []
+        
         try:
-            print(f"🔍 Searching: {keyword or 'all cars'}")
-            print(f"📊 Max results: {max_results}")
-            
-            playwright, browser = await self._create_browser()
-            page = await browser.new_page()
-            
-            search_url = f"{self.base_url}/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
-            params = []
-            
-            if keyword:
-                params.append(f"keyword={keyword}")
-            if min_price:
-                params.append(f"PRICE_FROM={min_price}")
-            if max_price:
-                params.append(f"PRICE_TO={max_price}")
-            params.append(f"rows={min(max_results, 100)}")
-            
-            if params:
-                search_url += "?" + "&".join(params)
-            
-            print(f"📡 URL: {search_url}")
-            await page.goto(search_url, wait_until='networkidle')
-            print("⏳ Waiting for page load...")
-            await asyncio.sleep(3)
-            
-            print("📦 Extracting data...")
-            page_content = await page.content()
-            json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_content, re.DOTALL)
-            
-            if not json_match:
-                print("❌ Could not find __NEXT_DATA__ in page")
-                return []
-            
-            print("✅ Found JSON data")
-            next_data = json.loads(json_match.group(1))
-            page_props = next_data['props']['pageProps']
-            search_result = page_props.get('searchResult', {})
-            listings = search_result.get('advertSummaryList', {}).get('advertSummary', [])
-            
-            print(f"✅ Found {len(listings)} listings")
-            
-            cars = []
-            for listing in listings[:max_results]:
-                car_data = self._parse_listing_from_json(listing)
-                if car_data:
-                    cars.append(car_data)
-                    print(f"  ✓ {car_data['name'][:40]}...")
-            
-            print(f"✅ Successfully parsed {len(cars)} cars")
-            return cars
-            
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                )
+                page = context.new_page()
+                
+                logger.info(f"Navigating to {self.BASE_URL}")
+                page.goto(self.BASE_URL, wait_until='networkidle', timeout=30000)
+                page.wait_for_timeout(2000)
+                
+                # Wait for listings to load
+                try:
+                    page.wait_for_selector('[data-testid="search-result-entry"]', timeout=10000)
+                except PlaywrightTimeout:
+                    logger.warning("No listings found or timeout waiting for listings")
+                    browser.close()
+                    return cars
+                
+                # Get all listing elements
+                listings = page.query_selector_all('[data-testid="search-result-entry"]')
+                logger.info(f"Found {len(listings)} listings on page")
+                
+                for idx, listing in enumerate(listings[:self.max_cars]):
+                    try:
+                        car_data = self._extract_car_data(listing, page)
+                        if car_data:
+                            cars.append(car_data)
+                            logger.info(f"Scraped car {idx + 1}: {car_data.get('title', 'Unknown')}")
+                    except Exception as e:
+                        logger.error(f"Error extracting car {idx + 1}: {str(e)}")
+                        continue
+                
+                browser.close()
+                
         except Exception as e:
-            print(f"❌ ERROR in search_cars: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return []
-        finally:
-            if browser:
-                print("🔒 Closing browser...")
-                await browser.close()
-            if playwright:
-                await playwright.stop()
+            logger.error(f"Scraping failed: {str(e)}")
+        
+        return cars
     
-    def search_cars(self, keyword: str = "", max_results: int = 20, min_price: int = None, max_price: int = None) -> List[Dict]:
-        """Search for cars on Willhaben (sync wrapper)"""
-        return asyncio.run(self._search_cars_async(keyword, max_results, min_price, max_price))
-    
-    def _parse_listing_from_json(self, listing: Dict) -> Optional[Dict]:
-        """Parse basic listing info from search results"""
+    def _extract_car_data(self, listing, page) -> Optional[Dict[str, Any]]:
+        """Extract car data from a listing element"""
         try:
-            listing_id = listing.get('id')
+            # Extract listing ID and URL
+            link_element = listing.query_selector('a[href*="/iad/"]')
+            if not link_element:
+                return None
+            
+            url = link_element.get_attribute('href')
+            if not url.startswith('http'):
+                url = f"https://www.willhaben.at{url}"
+            
+            # Extract listing ID from URL
+            listing_id = url.split('/')[-1].split('?')[0]
+            
+            # Extract title
+            title_element = listing.query_selector('[data-testid="contact-box-description"]')
+            title = title_element.inner_text().strip() if title_element else "Unknown"
+            
+            # Extract price
+            price = None
+            price_element = listing.query_selector('[data-testid="contact-box-price-box-price-label"]')
+            if price_element:
+                price_text = price_element.inner_text().strip()
+                price_text = price_text.replace('€', '').replace('.', '').replace(',', '.').strip()
+                try:
+                    price = float(price_text)
+                except ValueError:
+                    pass
+            
+            # Extract image
+            image_url = None
+            img_element = listing.query_selector('img')
+            if img_element:
+                image_url = img_element.get_attribute('src')
+            
+            # Extract attributes (brand, model, year, etc.)
+            attributes = {}
+            attr_elements = listing.query_selector_all('[data-testid="attribute"]')
+            for attr in attr_elements:
+                attr_text = attr.inner_text().strip()
+                if 'km' in attr_text.lower():
+                    try:
+                        mileage_str = attr_text.replace('km', '').replace('.', '').strip()
+                        attributes['mileage'] = int(mileage_str)
+                    except ValueError:
+                        pass
+                elif any(year_str in attr_text for year_str in ['2020', '2021', '2022', '2023', '2024', '2025']):
+                    try:
+                        attributes['year'] = int(''.join(filter(str.isdigit, attr_text)))
+                    except ValueError:
+                        pass
+            
+            # Extract location
+            location = None
+            location_element = listing.query_selector('[data-testid="top-card-description-location"]')
+            if location_element:
+                location = location_element.inner_text().strip()
+            
+            # Parse brand and model from title (basic implementation)
+            brand, model = self._parse_brand_model(title)
+            
             car_data = {
                 'listing_id': listing_id,
-                'name': listing.get('description', 'N/A'),
-                'price': None,
-                'url': None,
-                'thumbnail': None
+                'title': title,
+                'price': price,
+                'currency': 'EUR',
+                'brand': brand,
+                'model': model,
+                'year': attributes.get('year'),
+                'mileage': attributes.get('mileage'),
+                'fuel_type': None,  # Would need more detailed scraping
+                'transmission': None,  # Would need more detailed scraping
+                'location': location,
+                'image_url': image_url,
+                'url': url,
+                'description': title,  # Basic description
             }
-            
-            # Build URL
-            if listing_id:
-                contexes = listing.get('contextLinkList', {}).get('contextLink', [])
-                for context in contexes:
-                    if context.get('id') == 'seoSelfLink':
-                        seo_url = context.get('uri', '')
-                        match = re.search(r'/(gebrauchtwagen/d/auto/.+)$', seo_url)
-                        if match:
-                            car_data['url'] = f"{self.base_url}/iad/{match.group(1)}"
-                        break
-            
-            # Get price
-            attributes = listing.get('attributes', {}).get('attribute', [])
-            for attr in attributes:
-                if attr.get('name') == 'PRICE' and attr.get('values'):
-                    car_data['price'] = attr['values'][0]
-                    break
-            
-            # Get thumbnail (first image)
-            images = listing.get('advertImageList', {}).get('advertImage', [])
-            if images:
-                first_image = images[0]
-                car_data['thumbnail'] = (
-                    first_image.get('mainImageUrl') or 
-                    first_image.get('referenceImageUrl') or 
-                    first_image.get('thumbnailImageUrl')
-                )
             
             return car_data
             
         except Exception as e:
+            logger.error(f"Error extracting car data: {str(e)}")
             return None
     
-    async def _get_car_details_async(self, listing_id: str) -> Dict:
-        """Get essential car details and ALL images for any listing (async)"""
-        playwright = None
-        browser = None
+    def _parse_brand_model(self, title: str) -> tuple:
+        """Basic brand/model parsing from title"""
+        common_brands = [
+            'BMW', 'Mercedes', 'Audi', 'VW', 'Volkswagen', 'Opel', 'Ford',
+            'Renault', 'Peugeot', 'Citroën', 'Fiat', 'Seat', 'Skoda',
+            'Toyota', 'Honda', 'Mazda', 'Nissan', 'Hyundai', 'Kia'
+        ]
+        
+        title_upper = title.upper()
+        for brand in common_brands:
+            if brand.upper() in title_upper:
+                # Try to extract model (word after brand)
+                parts = title.split()
+                for i, part in enumerate(parts):
+                    if part.upper() == brand.upper() and i + 1 < len(parts):
+                        return brand, parts[i + 1]
+                return brand, None
+        
+        return None, None
+
+
+# ============================================================================
+# BACKGROUND JOBS
+# ============================================================================
+
+def scrape_and_store_cars():
+    """Background job to scrape cars and store in database"""
+    with app.app_context():
+        log_entry = ScrapingLog()
+        db.session.add(log_entry)
+        db.session.commit()
+        
         try:
-            print(f"🔍 Fetching details for listing: {listing_id}")
-            playwright, browser = await self._create_browser()
-            page = await browser.new_page()
+            logger.info("Starting background scraping job...")
             
-            url = f"{self.base_url}/iad/gebrauchtwagen/d/auto/listing-{listing_id}"
-            print(f"📡 URL: {url}")
-            await page.goto(url, wait_until='networkidle')
-            await asyncio.sleep(4)
+            scraper = WillhabenScraper(max_cars=100)
+            scraped_cars = scraper.scrape_listings()
             
-            page_content = await page.content()
-            json_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_content, re.DOTALL)
+            log_entry.cars_found = len(scraped_cars)
+            cars_added = 0
+            cars_updated = 0
             
-            if not json_match:
-                return {'error': 'Could not find listing data', 'listing_id': listing_id}
+            # Get all current listing IDs to mark inactive
+            current_listing_ids = {car['listing_id'] for car in scraped_cars}
             
-            next_data = json.loads(json_match.group(1))
-            page_props = next_data['props']['pageProps']
-            advert = page_props.get('advertDetails', {})
-            
-            # Initialize car data
-            car_data = {
-                'listing_id': listing_id,
-                'url': url,
-                'name': advert.get('description', 'N/A'),
-                'brand': None,
-                'model': None,
-                'car_type': None,
-                'year': None,
-                'mileage': None,
-                'price': None,
-                'fuel_type': None,
-                'power_kw': None,
-                'power_ps': None,
-                'transmission': None,
-                'color': None,
-                'doors': None,
-                'seats': None,
-                'condition': None,
-                'address': {
-                    'street': None,
-                    'postal_code': None,
-                    'city': None,
-                    'country': None
-                },
-                'images': [],
-                'image_count': 0
-            }
-            
-            # Extract attributes
-            attributes = advert.get('attributes', {}).get('attribute', [])
-            for attr in attributes:
-                name = attr.get('name')
-                values = attr.get('values', [])
-                value = values[0] if values else None
+            for car_data in scraped_cars:
+                existing_car = Car.query.filter_by(listing_id=car_data['listing_id']).first()
                 
-                if name == 'MAKE':
-                    car_data['brand'] = value
-                elif name == 'MODEL':
-                    car_data['model'] = value
-                elif name == 'BODYTYPE':
-                    car_data['car_type'] = value
-                elif name == 'YEAR_MODEL':
-                    car_data['year'] = value
-                elif name == 'MILEAGE':
-                    car_data['mileage'] = f"{value} km"
-                elif name == 'MOTOR_PRICE/TOTAL':
-                    car_data['price'] = f"€ {value}"
-                elif name == 'ENGINE/FUEL':
-                    car_data['fuel_type'] = value
-                elif name == 'ENGINE/EFFECT':
-                    car_data['power_kw'] = f"{value} kW"
-                elif name == 'MOTOR_POWER':
-                    car_data['power_ps'] = f"{value} PS"
-                elif name == 'TRANSMISSION':
-                    car_data['transmission'] = value
-                elif name == 'EXTERIOR_COLOUR_MAIN':
-                    car_data['color'] = value
-                elif name == 'NO_OF_DOORS':
-                    car_data['doors'] = value
-                elif name == 'NO_OF_SEATS':
-                    car_data['seats'] = value
-                elif name == 'MOTOR_CONDITION':
-                    car_data['condition'] = value
+                if existing_car:
+                    # Update existing car
+                    existing_car.last_seen_at = datetime.utcnow()
+                    existing_car.is_active = True
+                    existing_car.price = car_data.get('price')
+                    existing_car.updated_at = datetime.utcnow()
+                    cars_updated += 1
+                else:
+                    # Add new car
+                    new_car = Car(**car_data)
+                    db.session.add(new_car)
+                    cars_added += 1
             
-            # Extract address
-            address_details = advert.get('advertAddressDetails', {})
-            address_lines = address_details.get('addressLines', {}).get('value', [])
+            # Mark cars as inactive if not seen in this scrape
+            if current_listing_ids:
+                Car.query.filter(
+                    and_(
+                        Car.listing_id.notin_(current_listing_ids),
+                        Car.is_active == True
+                    )
+                ).update({'is_active': False}, synchronize_session=False)
             
-            if len(address_lines) >= 1:
-                car_data['address']['street'] = address_lines[0]
-            if len(address_lines) >= 2:
-                car_data['address']['city'] = address_lines[1]
+            db.session.commit()
             
-            car_data['address']['postal_code'] = address_details.get('postCode')
-            car_data['address']['country'] = address_details.get('country')
+            log_entry.scrape_completed_at = datetime.utcnow()
+            log_entry.cars_added = cars_added
+            log_entry.cars_updated = cars_updated
+            log_entry.status = 'success'
+            db.session.commit()
             
-            # Extract ALL images
-            print("📸 Extracting all images...")
-            image_list = advert.get('advertImageList', {}).get('advertImage', [])
-            
-            for img in image_list:
-                img_url = img.get('mainImageUrl') or img.get('referenceImageUrl') or img.get('thumbnailImageUrl')
-                
-                if img_url and img_url not in car_data['images']:
-                    car_data['images'].append(img_url)
-            
-            car_data['image_count'] = len(car_data['images'])
-            
-            print(f"✅ Successfully extracted details")
-            print(f"   📸 Images: {car_data['image_count']}")
-            print(f"   🚗 Car: {car_data['brand']} {car_data['model']}")
-            print(f"   📍 Location: {car_data['address']['postal_code']} {car_data['address']['city']}")
-            
-            return car_data
+            logger.info(f"Scraping completed: {cars_added} added, {cars_updated} updated, {len(scraped_cars)} total")
             
         except Exception as e:
-            print(f"❌ Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return {'error': str(e), 'listing_id': listing_id}
-        finally:
-            if browser:
-                await browser.close()
-            if playwright:
-                await playwright.stop()
-    
-    def get_car_details(self, listing_id: str) -> Dict:
-        """Get car details (sync wrapper)"""
-        return asyncio.run(self._get_car_details_async(listing_id))
+            logger.error(f"Scraping job failed: {str(e)}")
+            log_entry.status = 'failed'
+            log_entry.error_message = str(e)
+            log_entry.scrape_completed_at = datetime.utcnow()
+            db.session.commit()
 
 
-# Initialize scraper
-scraper = WillhabenCarScraper()
+def cleanup_inactive_cars():
+    """Daily cleanup job to remove old inactive cars"""
+    with app.app_context():
+        try:
+            logger.info("Starting daily cleanup job...")
+            
+            # Remove cars that have been inactive for more than 7 days
+            cutoff_date = datetime.utcnow() - timedelta(days=7)
+            deleted_count = Car.query.filter(
+                and_(
+                    Car.is_active == False,
+                    Car.last_seen_at < cutoff_date
+                )
+            ).delete()
+            
+            db.session.commit()
+            logger.info(f"Cleanup completed: {deleted_count} cars removed")
+            
+        except Exception as e:
+            logger.error(f"Cleanup job failed: {str(e)}")
+            db.session.rollback()
 
-# API Routes
 
-@app.route('/')
-def home():
-    """API documentation"""
-    return jsonify({
-        'name': 'Willhaben Car Scraper API',
-        'version': '8.0 (Playwright)',
-        'description': 'Extracts essential car info and ALL images from any listing',
-        'endpoints': {
-            '/api/search': {
-                'method': 'GET',
-                'description': 'Search for cars',
-                'parameters': {
-                    'keyword': 'Search keyword (e.g., BMW, Audi)',
-                    'max_results': 'Maximum results (default: 20, max: 100)',
-                    'min_price': 'Minimum price',
-                    'max_price': 'Maximum price'
-                },
-                'example': '/api/search?keyword=Audi&max_results=10'
-            },
-            '/api/car/<listing_id>': {
-                'method': 'GET',
-                'description': 'Get car details by listing ID - works for ANY car listing',
-                'examples': [
-                    '/api/car/1880510138  (BMW X3)',
-                    '/api/car/1234567890  (Any other car)',
-                    '/api/car/9876543210  (Any listing ID)'
-                ]
-            },
-            '/api/health': {
-                'method': 'GET',
-                'description': 'Health check'
-            }
-        },
-        'data_extracted': {
-            'basic_info': ['listing_id', 'url', 'name', 'brand', 'model', 'car_type', 'year', 'price'],
-            'technical': ['mileage', 'fuel_type', 'power_kw', 'power_ps', 'transmission', 'color', 'doors', 'seats', 'condition'],
-            'address': ['street', 'postal_code', 'city', 'country'],
-            'images': ['ALL images in high quality', 'image_count']
-        }
-    })
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
-@app.route('/api/search', methods=['GET'])
-def search_cars():
-    """Search for cars"""
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
     try:
-        keyword = request.args.get('keyword', '')
-        max_results = int(request.args.get('max_results', 20))
-        min_price = request.args.get('min_price', type=int)
-        max_price = request.args.get('max_price', type=int)
-        
-        if max_results > 100:
-            max_results = 100
-        
-        print(f"\n{'='*60}")
-        print(f"🔍 Search Request: {keyword or 'all cars'} (max {max_results})")
-        print(f"{'='*60}\n")
-        
-        results = scraper.search_cars(
-            keyword=keyword,
-            max_results=max_results,
-            min_price=min_price,
-            max_price=max_price
-        )
-        
-        if results is None:
-            results = []
-        
-        response = {
-            'success': len(results) > 0,
-            'count': len(results),
-            'results': results
-        }
-        
-        if len(results) == 0:
-            response['message'] = 'No results found or error occurred. Check server logs.'
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        print(f"❌ ERROR in search endpoint: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        # Check database connection
+        db.session.execute('SELECT 1')
         return jsonify({
-            'success': False,
-            'error': str(e),
-            'message': 'An error occurred while searching. Please try again.'
+            'status': 'healthy',
+            'database': 'connected',
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'database': 'disconnected',
+            'error': str(e)
         }), 500
 
-@app.route('/api/car/<listing_id>', methods=['GET'])
-def get_car_details(listing_id):
-    """Get car details by listing ID - works for ANY car"""
-    print(f"\n{'='*60}")
-    print(f"📄 Getting details for listing: {listing_id}")
-    print(f"{'='*60}\n")
-    
-    details = scraper.get_car_details(listing_id)
-    
-    return jsonify({
-        'success': True,
-        'data': details
-    })
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check"""
-    return jsonify({
-        'status': 'healthy',
-        'service': 'Willhaben Car Scraper API',
-        'version': '8.0 (Playwright)'
-    })
+@app.route('/api/cars', methods=['GET'])
+def get_cars():
+    """Get paginated list of cars"""
+    try:
+        page = request.args.get('page', 1, type=int)
+        limit = request.args.get('limit', 20, type=int)
+        
+        # Limit max results per page
+        limit = min(limit, 100)
+        
+        # Query active cars
+        query = Car.query.filter_by(is_active=True).order_by(Car.first_seen_at.desc())
+        
+        # Paginate
+        pagination = query.paginate(page=page, per_page=limit, error_out=False)
+        
+        return jsonify({
+            'cars': [car.to_dict() for car in pagination.items],
+            'pagination': {
+                'page': page,
+                'limit': limit,
+                'total': pagination.total,
+                'pages': pagination.pages,
+                'has_next': pagination.has_next,
+                'has_prev': pagination.has_prev
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in get_cars: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/cars/<listing_id>', methods=['GET'])
+def get_car(listing_id):
+    """Get single car by listing ID"""
+    try:
+        car = Car.query.filter_by(listing_id=listing_id, is_active=True).first()
+        
+        if not car:
+            return jsonify({'error': 'Car not found'}), 404
+        
+        return jsonify({'car': car.to_dict()}), 200
+        
+    except Exception as e:
+        logger.error(f"Error in get_car: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/cars/search', methods=['GET'])
+def search_cars():
+    """Search cars with filters"""
+    try:
+        # Get query parameters
+        brand = request.args.get('brand')
+        model = request.args.get('model')
+        min_price = request.args.get('min_price', type=float)
+        max_price = request.args.get('max_price', type=float)
+        min_year = request.args.get('min_year', type=int)
+        max_year = request.args.get('max_year', type=int)
+        page = request.args.get('page', 1, type=int)
+        limit = request.args.get('limit', 20, type=int)
+        
+        # Build query
+        query = Car.query.filter_by(is_active=True)
+        
+        if brand:
+            query = query.filter(Car.brand.ilike(f'%{brand}%'))
+        if model:
+            query = query.filter(Car.model.ilike(f'%{model}%'))
+        if min_price is not None:
+            query = query.filter(Car.price >= min_price)
+        if max_price is not None:
+            query = query.filter(Car.price <= max_price)
+        if min_year is not None:
+            query = query.filter(Car.year >= min_year)
+        if max_year is not None:
+            query = query.filter(Car.year <= max_year)
+        
+        query = query.order_by(Car.first_seen_at.desc())
+        
+        # Paginate
+        limit = min(limit, 100)
+        pagination = query.paginate(page=page, per_page=limit, error_out=False)
+        
+        return jsonify({
+            'cars': [car.to_dict() for car in pagination.items],
+            'filters': {
+                'brand': brand,
+                'model': model,
+                'min_price': min_price,
+                'max_price': max_price,
+                'min_year': min_year,
+                'max_year': max_year
+            },
+            'pagination': {
+                'page': page,
+                'limit': limit,
+                'total': pagination.total,
+                'pages': pagination.pages,
+                'has_next': pagination.has_next,
+                'has_prev': pagination.has_prev
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in search_cars: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/cars/recent', methods=['GET'])
+def get_recent_cars():
+    """Get cars added in the last 24 hours"""
+    try:
+        cutoff_time = datetime.utcnow() - timedelta(hours=24)
+        limit = request.args.get('limit', 20, type=int)
+        limit = min(limit, 100)
+        
+        cars = Car.query.filter(
+            and_(
+                Car.is_active == True,
+                Car.first_seen_at >= cutoff_time
+            )
+        ).order_by(Car.first_seen_at.desc()).limit(limit).all()
+        
+        return jsonify({
+            'cars': [car.to_dict() for car in cars],
+            'count': len(cars),
+            'cutoff_time': cutoff_time.isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in get_recent_cars: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get scraping statistics"""
+    try:
+        total_cars = Car.query.filter_by(is_active=True).count()
+        total_brands = db.session.query(func.count(func.distinct(Car.brand))).scalar()
+        
+        recent_scrape = ScrapingLog.query.order_by(ScrapingLog.scrape_started_at.desc()).first()
+        
+        stats = {
+            'total_active_cars': total_cars,
+            'total_brands': total_brands,
+            'last_scrape': recent_scrape.scrape_started_at.isoformat() if recent_scrape else None,
+            'last_scrape_status': recent_scrape.status if recent_scrape else None,
+            'last_scrape_cars_found': recent_scrape.cars_found if recent_scrape else 0
+        }
+        
+        return jsonify(stats), 200
+        
+    except Exception as e:
+        logger.error(f"Error in get_stats: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/trigger-scrape', methods=['POST'])
+def trigger_scrape():
+    """Manual trigger for scraping (useful for testing)"""
+    try:
+        scrape_and_store_cars()
+        return jsonify({'message': 'Scraping job triggered successfully'}), 200
+    except Exception as e:
+        logger.error(f"Error triggering scrape: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# SCHEDULER SETUP
+# ============================================================================
+
+def init_scheduler():
+    """Initialize APScheduler with background jobs"""
+    scheduler = BackgroundScheduler(timezone='UTC')
+    
+    # Background scraper - every 5 minutes
+    scheduler.add_job(
+        func=scrape_and_store_cars,
+        trigger=IntervalTrigger(minutes=5),
+        id='scrape_job',
+        name='Scrape cars every 5 minutes',
+        replace_existing=True
+    )
+    
+    # Daily cleanup at 00:00 CET (23:00 UTC in winter, 22:00 UTC in summer)
+    # Using 23:00 UTC for simplicity
+    scheduler.add_job(
+        func=cleanup_inactive_cars,
+        trigger=CronTrigger(hour=23, minute=0),
+        id='cleanup_job',
+        name='Daily cleanup at 00:00 CET',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    logger.info("Scheduler started with jobs: scrape_job (every 5 min), cleanup_job (daily at 00:00 CET)")
+    
+    # Shut down the scheduler when exiting the app
+    atexit.register(lambda: scheduler.shutdown())
+    
+    return scheduler
+
+
+# ============================================================================
+# APP INITIALIZATION
+# ============================================================================
+
+def init_app():
+    """Initialize the application"""
+    with app.app_context():
+        # Create tables
+        db.create_all()
+        logger.info("Database tables created")
+        
+        # Check if we have any cars, if not run initial scrape
+        car_count = Car.query.count()
+        if car_count == 0:
+            logger.info("No cars in database, running initial scrape...")
+            try:
+                scrape_and_store_cars()
+            except Exception as e:
+                logger.error(f"Initial scrape failed: {str(e)}")
+
+
+# Initialize on startup
+if __name__ != '__main__':
+    # Running with gunicorn
+    init_app()
+    scheduler = init_scheduler()
+
 
 if __name__ == '__main__':
-    import os
-    
-    print("=" * 80)
-    print("🚗 Willhaben Car Scraper API v8.0 (Playwright)")
-    print("=" * 80)
-    print("\n✨ Features:")
-    print("   📋 Essential car information (brand, model, year, price, etc.)")
-    print("   📍 Complete address (street, postal code, city, country)")
-    print("   📸 ALL images from any listing")
-    print("   🔢 Works with ANY listing ID")
-    print("   🎭 Powered by Playwright (easier deployment)")
-    print("\n📋 Endpoints:")
-    print("   • /")
-    print("   • /api/search?keyword=BMW")
-    print("   • /api/car/<any_listing_id>")
-    print("\n💡 Examples:")
-    print("   curl https://your-api.com/api/car/1880510138")
-    print("   curl https://your-api.com/api/search?keyword=Audi&max_results=5")
-    print("\n" + "=" * 80 + "\n")
-    
-    # Use PORT from environment (for deployment) or 5001 for local
-    port = int(os.environ.get('PORT', 5001))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    # Running directly with python
+    init_app()
+    scheduler = init_scheduler()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
