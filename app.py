@@ -374,8 +374,9 @@ def cleanup_inactive_cars():
 def health_check():
     """Health check endpoint"""
     try:
-        # Check database connection
-        db.session.execute('SELECT 1')
+        # Check database connection - fixed SQLAlchemy syntax
+        from sqlalchemy import text
+        db.session.execute(text('SELECT 1'))
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
