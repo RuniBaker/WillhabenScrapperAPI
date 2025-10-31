@@ -116,7 +116,7 @@ class ScrapingLog(db.Model):
 class WillhabenScraper:
     """Scraper for willhaben.at car listings"""
     
-    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
+    BASE_URL = "https://www.willhaben.at/iad/kaufen-und-verkaufen/auto"
     
     def __init__(self, max_cars: int = 100):
         self.max_cars = max_cars
@@ -130,147 +130,185 @@ class WillhabenScraper:
         
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox']
+                )
+                
                 context = browser.new_context(
                     viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 )
+                
                 page = context.new_page()
                 
                 logger.info(f"Navigating to {self.BASE_URL}")
-                page.goto(self.BASE_URL, wait_until='networkidle', timeout=30000)
+                page.goto(self.BASE_URL, wait_until='domcontentloaded', timeout=30000)
+                
+                # Wait longer for JavaScript to render content
+                logger.info("Waiting for content to load...")
+                page.wait_for_timeout(5000)
+                
+                # Scroll to trigger lazy loading
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
                 page.wait_for_timeout(2000)
                 
-                # Wait for listings to load
-                try:
-                    page.wait_for_selector('[data-testid="search-result-entry"]', timeout=10000)
-                except PlaywrightTimeout:
-                    logger.warning("No listings found or timeout waiting for listings")
-                    browser.close()
-                    return cars
+                # Find all car listing links
+                all_links = page.query_selector_all('a[href*="/iad/"]')
+                logger.info(f"Found {len(all_links)} total links")
                 
-                # Get all listing elements
-                listings = page.query_selector_all('[data-testid="search-result-entry"]')
-                logger.info(f"Found {len(listings)} listings on page")
+                # Filter to only car listing links (they have specific patterns)
+                car_links = []
+                seen_ids = set()
                 
-                for idx, listing in enumerate(listings[:self.max_cars]):
+                for link in all_links:
+                    href = link.get_attribute('href')
+                    if not href:
+                        continue
+                    
+                    # Car listings typically have numeric IDs at the end
+                    # Example: /iad/kaufen-und-verkaufen/auto/bmw-3er-320d/123456789
+                    if '/auto/' in href and href.split('/')[-1].isdigit():
+                        listing_id = href.split('/')[-1]
+                        if listing_id not in seen_ids:
+                            car_links.append((link, href, listing_id))
+                            seen_ids.add(listing_id)
+                
+                logger.info(f"Found {len(car_links)} unique car listings")
+                
+                # Process each car listing
+                for idx, (link_element, href, listing_id) in enumerate(car_links[:self.max_cars]):
                     try:
-                        car_data = self._extract_car_data(listing, page)
-                        if car_data:
-                            cars.append(car_data)
-                            logger.info(f"Scraped car {idx + 1}: {car_data.get('title', 'Unknown')}")
+                        # Build full URL
+                        if not href.startswith('http'):
+                            url = f"https://www.willhaben.at{href}"
+                        else:
+                            url = href
+                        
+                        # Get the parent container to extract data
+                        parent = link_element
+                        for _ in range(5):  # Go up max 5 levels to find the card
+                            parent = parent.evaluate_handle('el => el.parentElement').as_element()
+                            if not parent:
+                                break
+                        
+                        # Extract text from the card
+                        if parent:
+                            text_content = parent.inner_text()
+                        else:
+                            text_content = link_element.inner_text()
+                        
+                        # Extract title (usually the first line or link text)
+                        title = link_element.inner_text().strip()
+                        if not title or len(title) < 3:
+                            title = text_content.split('\n')[0][:100] if text_content else f"Car Listing {listing_id}"
+                        
+                        # Extract image
+                        image_url = None
+                        if parent:
+                            img = parent.query_selector('img')
+                            if img:
+                                image_url = img.get_attribute('src') or img.get_attribute('data-src')
+                        
+                        # Parse price from text
+                        price = None
+                        import re
+                        price_match = re.search(r'€\s*([\d.,]+)', text_content)
+                        if price_match:
+                            try:
+                                price_str = price_match.group(1).replace('.', '').replace(',', '.')
+                                price = float(price_str)
+                            except:
+                                pass
+                        
+                        # Parse year
+                        year = None
+                        year_match = re.search(r'\b(19|20)\d{2}\b', text_content)
+                        if year_match:
+                            try:
+                                year = int(year_match.group(0))
+                            except:
+                                pass
+                        
+                        # Parse mileage (km)
+                        mileage = None
+                        mileage_match = re.search(r'([\d.]+)\s*km', text_content, re.IGNORECASE)
+                        if mileage_match:
+                            try:
+                                mileage_str = mileage_match.group(1).replace('.', '')
+                                mileage = int(mileage_str)
+                            except:
+                                pass
+                        
+                        # Parse location (usually at the end)
+                        location = None
+                        lines = text_content.split('\n')
+                        for line in reversed(lines):
+                            line = line.strip()
+                            # Austrian postal codes are 4 digits
+                            if re.search(r'\b\d{4}\b', line) and len(line) < 50:
+                                location = line
+                                break
+                        
+                        # Parse brand and model from title
+                        brand, model = self._parse_brand_model(title)
+                        
+                        car_data = {
+                            'listing_id': listing_id,
+                            'title': title[:500],  # Limit title length
+                            'price': price,
+                            'currency': 'EUR',
+                            'brand': brand,
+                            'model': model,
+                            'year': year,
+                            'mileage': mileage,
+                            'fuel_type': None,  # Would need detail page scraping
+                            'transmission': None,  # Would need detail page scraping
+                            'location': location,
+                            'image_url': image_url,
+                            'url': url,
+                            'description': text_content[:500] if text_content else title,
+                        }
+                        
+                        cars.append(car_data)
+                        logger.info(f"Scraped car {idx + 1}/{min(len(car_links), self.max_cars)}: {title[:50]}...")
+                        
                     except Exception as e:
                         logger.error(f"Error extracting car {idx + 1}: {str(e)}")
                         continue
                 
                 browser.close()
+                logger.info(f"Scraping completed: {len(cars)} cars extracted")
                 
         except Exception as e:
             logger.error(f"Scraping failed: {str(e)}")
         
         return cars
     
-    def _extract_car_data(self, listing, page) -> Optional[Dict[str, Any]]:
-        """Extract car data from a listing element"""
-        try:
-            # Extract listing ID and URL
-            link_element = listing.query_selector('a[href*="/iad/"]')
-            if not link_element:
-                return None
-            
-            url = link_element.get_attribute('href')
-            if not url.startswith('http'):
-                url = f"https://www.willhaben.at{url}"
-            
-            # Extract listing ID from URL
-            listing_id = url.split('/')[-1].split('?')[0]
-            
-            # Extract title
-            title_element = listing.query_selector('[data-testid="contact-box-description"]')
-            title = title_element.inner_text().strip() if title_element else "Unknown"
-            
-            # Extract price
-            price = None
-            price_element = listing.query_selector('[data-testid="contact-box-price-box-price-label"]')
-            if price_element:
-                price_text = price_element.inner_text().strip()
-                price_text = price_text.replace('€', '').replace('.', '').replace(',', '.').strip()
-                try:
-                    price = float(price_text)
-                except ValueError:
-                    pass
-            
-            # Extract image
-            image_url = None
-            img_element = listing.query_selector('img')
-            if img_element:
-                image_url = img_element.get_attribute('src')
-            
-            # Extract attributes (brand, model, year, etc.)
-            attributes = {}
-            attr_elements = listing.query_selector_all('[data-testid="attribute"]')
-            for attr in attr_elements:
-                attr_text = attr.inner_text().strip()
-                if 'km' in attr_text.lower():
-                    try:
-                        mileage_str = attr_text.replace('km', '').replace('.', '').strip()
-                        attributes['mileage'] = int(mileage_str)
-                    except ValueError:
-                        pass
-                elif any(year_str in attr_text for year_str in ['2020', '2021', '2022', '2023', '2024', '2025']):
-                    try:
-                        attributes['year'] = int(''.join(filter(str.isdigit, attr_text)))
-                    except ValueError:
-                        pass
-            
-            # Extract location
-            location = None
-            location_element = listing.query_selector('[data-testid="top-card-description-location"]')
-            if location_element:
-                location = location_element.inner_text().strip()
-            
-            # Parse brand and model from title (basic implementation)
-            brand, model = self._parse_brand_model(title)
-            
-            car_data = {
-                'listing_id': listing_id,
-                'title': title,
-                'price': price,
-                'currency': 'EUR',
-                'brand': brand,
-                'model': model,
-                'year': attributes.get('year'),
-                'mileage': attributes.get('mileage'),
-                'fuel_type': None,  # Would need more detailed scraping
-                'transmission': None,  # Would need more detailed scraping
-                'location': location,
-                'image_url': image_url,
-                'url': url,
-                'description': title,  # Basic description
-            }
-            
-            return car_data
-            
-        except Exception as e:
-            logger.error(f"Error extracting car data: {str(e)}")
-            return None
-    
     def _parse_brand_model(self, title: str) -> tuple:
         """Basic brand/model parsing from title"""
         common_brands = [
-            'BMW', 'Mercedes', 'Audi', 'VW', 'Volkswagen', 'Opel', 'Ford',
-            'Renault', 'Peugeot', 'Citroën', 'Fiat', 'Seat', 'Skoda',
-            'Toyota', 'Honda', 'Mazda', 'Nissan', 'Hyundai', 'Kia'
+            'Abarth', 'Alfa Romeo', 'Audi', 'BMW', 'Chevrolet', 'Citroën', 'Citroen',
+            'Cupra', 'Dacia', 'Fiat', 'Ford', 'Honda', 'Hyundai', 'Jaguar',
+            'Jeep', 'Kia', 'Land Rover', 'Lexus', 'Mazda', 'Mercedes', 'Mercedes-Benz',
+            'Mini', 'Mitsubishi', 'Nissan', 'Opel', 'Peugeot', 'Porsche', 'Renault',
+            'Seat', 'Skoda', 'Smart', 'Subaru', 'Suzuki', 'Tesla', 'Toyota',
+            'Volkswagen', 'VW', 'Volvo'
         ]
         
         title_upper = title.upper()
+        
         for brand in common_brands:
             if brand.upper() in title_upper:
                 # Try to extract model (word after brand)
-                parts = title.split()
-                for i, part in enumerate(parts):
-                    if part.upper() == brand.upper() and i + 1 < len(parts):
-                        return brand, parts[i + 1]
+                # Use regex to find the brand and capture what comes after
+                pattern = re.compile(rf'\b{re.escape(brand)}\b\s+(\S+)', re.IGNORECASE)
+                match = pattern.search(title)
+                if match:
+                    model = match.group(1)
+                    # Clean up model (remove non-alphanumeric except dash)
+                    model = re.sub(r'[^\w\s-]', '', model).strip()
+                    return brand, model if model else None
                 return brand, None
         
         return None, None
