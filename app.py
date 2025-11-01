@@ -379,8 +379,12 @@ class WillhabenScraper:
                             return brand, model
                 
                 return brand, None
+            
+            
         
         return None, None
+    
+    
 
 
 # ============================================================================
@@ -476,7 +480,82 @@ def cleanup_inactive_cars():
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-
+@app.route('/api/debug-links', methods=['GET'])
+def debug_links():
+    """Debug endpoint to see actual links found"""
+    try:
+        from playwright.sync_api import sync_playwright
+        
+        results = {
+            'status': 'running',
+            'all_links': [],
+            'car_links': [],
+            'errors': []
+        }
+        
+        url = request.args.get('url', 'https://www.willhaben.at/iad/kaufen-und-verkaufen/auto')
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            page = context.new_page()
+            
+            # Navigate
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(7000)
+            
+            # Scroll
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            page.wait_for_timeout(2000)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
+            
+            # Get all links
+            all_links = page.query_selector_all('a[href*="/iad/"]')
+            
+            # Extract all hrefs
+            for link in all_links:
+                href = link.get_attribute('href')
+                if href:
+                    link_text = link.inner_text().strip()[:100]
+                    results['all_links'].append({
+                        'href': href,
+                        'text': link_text
+                    })
+            
+            # Filter car links
+            seen_ids = set()
+            for link_data in results['all_links']:
+                href = link_data['href']
+                parts = href.split('/')
+                
+                if 'auto' in href:
+                    potential_id = parts[-1].split('?')[0]
+                    if potential_id.isdigit() and potential_id not in seen_ids:
+                        seen_ids.add(potential_id)
+                        results['car_links'].append({
+                            'id': potential_id,
+                            'href': href,
+                            'text': link_data['text']
+                        })
+            
+            browser.close()
+        
+        results['status'] = 'completed'
+        results['total_links'] = len(results['all_links'])
+        results['total_car_links'] = len(results['car_links'])
+        
+        return jsonify(results), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'failed',
+            'error': str(e)
+        }), 500
+     
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -746,6 +825,8 @@ def test_scrape():
             'error': str(e),
             'error_type': type(e).__name__
         }), 500
+    
+
 # ============================================================================
 # SCHEDULER SETUP
 # ============================================================================
