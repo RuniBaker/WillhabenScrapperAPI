@@ -132,7 +132,7 @@ class WillhabenScraper:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox']
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
                 )
                 
                 context = browser.new_context(
@@ -145,92 +145,149 @@ class WillhabenScraper:
                 logger.info(f"Navigating to {self.BASE_URL}")
                 page.goto(self.BASE_URL, wait_until='domcontentloaded', timeout=30000)
                 
-                # Wait longer for JavaScript to render content
-                logger.info("Waiting for content to load...")
-                page.wait_for_timeout(5000)
+                # Wait for JavaScript to render
+                logger.info("Waiting for dynamic content to load...")
+                page.wait_for_timeout(7000)
                 
-                # Scroll to trigger lazy loading
+                # Scroll to load more content
+                logger.info("Scrolling page to trigger lazy loading...")
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
                 page.wait_for_timeout(2000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2000)
                 
-                # Find all car listing links
+                # Get all links containing /iad/
+                logger.info("Extracting car listing links...")
                 all_links = page.query_selector_all('a[href*="/iad/"]')
-                logger.info(f"Found {len(all_links)} total links")
+                logger.info(f"Found {len(all_links)} total /iad/ links")
                 
-                # Filter to only car listing links (they have specific patterns)
-                car_links = []
+                # Extract unique car listings
+                car_listings = []
                 seen_ids = set()
                 
                 for link in all_links:
-                    href = link.get_attribute('href')
-                    if not href:
+                    try:
+                        href = link.get_attribute('href')
+                        if not href:
+                            continue
+                        
+                        # Car listings have pattern: /iad/.../auto/.../NUMERIC_ID
+                        # Example: /iad/kaufen-und-verkaufen/auto/seat-ibiza-1-4-16v-reference/535416196
+                        parts = href.split('/')
+                        
+                        # Check if it's an auto listing with numeric ID
+                        if len(parts) >= 3 and 'auto' in href:
+                            # Last part should be numeric ID
+                            potential_id = parts[-1].split('?')[0]  # Remove query params
+                            
+                            if potential_id.isdigit() and potential_id not in seen_ids:
+                                listing_id = potential_id
+                                seen_ids.add(listing_id)
+                                
+                                # Build full URL
+                                if not href.startswith('http'):
+                                    full_url = f"https://www.willhaben.at{href}"
+                                else:
+                                    full_url = href
+                                
+                                car_listings.append({
+                                    'link_element': link,
+                                    'url': full_url,
+                                    'listing_id': listing_id
+                                })
+                    except Exception as e:
+                        logger.debug(f"Error processing link: {str(e)}")
                         continue
-                    
-                    # Car listings typically have numeric IDs at the end
-                    # Example: /iad/kaufen-und-verkaufen/auto/bmw-3er-320d/123456789
-                    if '/auto/' in href and href.split('/')[-1].isdigit():
-                        listing_id = href.split('/')[-1]
-                        if listing_id not in seen_ids:
-                            car_links.append((link, href, listing_id))
-                            seen_ids.add(listing_id)
                 
-                logger.info(f"Found {len(car_links)} unique car listings")
+                logger.info(f"Found {len(car_listings)} unique car listings")
+                
+                if len(car_listings) == 0:
+                    logger.warning("No car listings found! Page might not have loaded properly.")
+                    browser.close()
+                    return cars
                 
                 # Process each car listing
-                for idx, (link_element, href, listing_id) in enumerate(car_links[:self.max_cars]):
+                for idx, listing_data in enumerate(car_listings[:self.max_cars]):
                     try:
-                        # Build full URL
-                        if not href.startswith('http'):
-                            url = f"https://www.willhaben.at{href}"
-                        else:
-                            url = href
+                        link_element = listing_data['link_element']
+                        url = listing_data['url']
+                        listing_id = listing_data['listing_id']
                         
-                        # Get the parent container to extract data
-                        parent = link_element
-                        for _ in range(5):  # Go up max 5 levels to find the card
-                            parent = parent.evaluate_handle('el => el.parentElement').as_element()
-                            if not parent:
-                                break
+                        # Get text content from the link and its parent container
+                        link_text = link_element.inner_text().strip()
                         
-                        # Extract text from the card
-                        if parent:
-                            text_content = parent.inner_text()
-                        else:
-                            text_content = link_element.inner_text()
+                        # Try to get parent container with more info
+                        try:
+                            # Go up the DOM tree to find the card container
+                            parent = link_element.evaluate_handle('el => el.closest("article, [class*=\"Card\"], [class*=\"card\"], [class*=\"Item\"], [class*=\"item\"])')
+                            parent_element = parent.as_element() if parent else None
+                            
+                            if parent_element:
+                                text_content = parent_element.inner_text()
+                            else:
+                                # Fallback: go up 3 levels
+                                parent_el = link_element
+                                for _ in range(3):
+                                    parent_handle = parent_el.evaluate_handle('el => el.parentElement')
+                                    parent_el = parent_handle.as_element()
+                                    if not parent_el:
+                                        break
+                                text_content = parent_el.inner_text() if parent_el else link_text
+                        except:
+                            text_content = link_text
                         
-                        # Extract title (usually the first line or link text)
-                        title = link_element.inner_text().strip()
-                        if not title or len(title) < 3:
-                            title = text_content.split('\n')[0][:100] if text_content else f"Car Listing {listing_id}"
+                        # Use link text as title, fallback to first line of content
+                        title = link_text if link_text and len(link_text) > 5 else text_content.split('\n')[0]
+                        title = title[:500]  # Limit length
                         
-                        # Extract image
+                        # Extract image - try multiple methods
                         image_url = None
-                        if parent:
-                            img = parent.query_selector('img')
-                            if img:
-                                image_url = img.get_attribute('src') or img.get_attribute('data-src')
+                        try:
+                            # Try to find img near the link
+                            img_handle = link_element.evaluate_handle('''el => {
+                                return el.querySelector('img') || 
+                                       el.parentElement?.querySelector('img') ||
+                                       el.parentElement?.parentElement?.querySelector('img');
+                            }''')
+                            img_element = img_handle.as_element() if img_handle else None
+                            
+                            if img_element:
+                                image_url = (img_element.get_attribute('src') or 
+                                           img_element.get_attribute('data-src') or
+                                           img_element.get_attribute('data-lazy-src'))
+                        except:
+                            pass
                         
                         # Parse price from text
                         price = None
                         import re
-                        price_match = re.search(r'€\s*([\d.,]+)', text_content)
-                        if price_match:
-                            try:
-                                price_str = price_match.group(1).replace('.', '').replace(',', '.')
-                                price = float(price_str)
-                            except:
-                                pass
+                        # Match patterns like "€ 15.900" or "15.900 €" or "€15900"
+                        price_patterns = [
+                            r'€\s*([\d.,]+)',
+                            r'([\d.,]+)\s*€',
+                        ]
+                        for pattern in price_patterns:
+                            price_match = re.search(pattern, text_content)
+                            if price_match:
+                                try:
+                                    price_str = price_match.group(1).replace('.', '').replace(',', '.')
+                                    price = float(price_str)
+                                    break
+                                except:
+                                    pass
                         
-                        # Parse year
+                        # Parse year (4-digit number starting with 19 or 20)
                         year = None
-                        year_match = re.search(r'\b(19|20)\d{2}\b', text_content)
+                        year_match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', text_content)
                         if year_match:
                             try:
-                                year = int(year_match.group(0))
+                                year_candidate = int(year_match.group(0))
+                                if 1990 <= year_candidate <= 2025:
+                                    year = year_candidate
                             except:
                                 pass
                         
-                        # Parse mileage (km)
+                        # Parse mileage (look for numbers followed by km)
                         mileage = None
                         mileage_match = re.search(r'([\d.]+)\s*km', text_content, re.IGNORECASE)
                         if mileage_match:
@@ -240,30 +297,26 @@ class WillhabenScraper:
                             except:
                                 pass
                         
-                        # Parse location (usually at the end)
+                        # Parse location (Austrian postal codes are 4 digits + city name)
                         location = None
-                        lines = text_content.split('\n')
-                        for line in reversed(lines):
-                            line = line.strip()
-                            # Austrian postal codes are 4 digits
-                            if re.search(r'\b\d{4}\b', line) and len(line) < 50:
-                                location = line
-                                break
+                        location_match = re.search(r'\b(\d{4}\s+[A-ZÄÖÜa-zäöüß\s-]+?)(?:\n|$)', text_content)
+                        if location_match:
+                            location = location_match.group(1).strip()[:200]
                         
                         # Parse brand and model from title
                         brand, model = self._parse_brand_model(title)
                         
                         car_data = {
                             'listing_id': listing_id,
-                            'title': title[:500],  # Limit title length
+                            'title': title,
                             'price': price,
                             'currency': 'EUR',
                             'brand': brand,
                             'model': model,
                             'year': year,
                             'mileage': mileage,
-                            'fuel_type': None,  # Would need detail page scraping
-                            'transmission': None,  # Would need detail page scraping
+                            'fuel_type': None,
+                            'transmission': None,
                             'location': location,
                             'image_url': image_url,
                             'url': url,
@@ -271,44 +324,60 @@ class WillhabenScraper:
                         }
                         
                         cars.append(car_data)
-                        logger.info(f"Scraped car {idx + 1}/{min(len(car_links), self.max_cars)}: {title[:50]}...")
+                        logger.info(f"✓ Scraped {idx + 1}/{min(len(car_listings), self.max_cars)}: {title[:60]}... (€{price or '?'}, {year or '?'})")
                         
                     except Exception as e:
-                        logger.error(f"Error extracting car {idx + 1}: {str(e)}")
+                        logger.error(f"✗ Error extracting car {idx + 1} (ID: {listing_data.get('listing_id', '?')}): {str(e)}")
                         continue
                 
                 browser.close()
-                logger.info(f"Scraping completed: {len(cars)} cars extracted")
+                logger.info(f"Scraping completed successfully: {len(cars)} cars extracted")
                 
         except Exception as e:
             logger.error(f"Scraping failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
         
         return cars
     
     def _parse_brand_model(self, title: str) -> tuple:
-        """Basic brand/model parsing from title"""
+        """Enhanced brand/model parsing from title"""
+        import re
+        
+        # Extended list of car brands
         common_brands = [
-            'Abarth', 'Alfa Romeo', 'Audi', 'BMW', 'Chevrolet', 'Citroën', 'Citroen',
-            'Cupra', 'Dacia', 'Fiat', 'Ford', 'Honda', 'Hyundai', 'Jaguar',
-            'Jeep', 'Kia', 'Land Rover', 'Lexus', 'Mazda', 'Mercedes', 'Mercedes-Benz',
-            'Mini', 'Mitsubishi', 'Nissan', 'Opel', 'Peugeot', 'Porsche', 'Renault',
-            'Seat', 'Skoda', 'Smart', 'Subaru', 'Suzuki', 'Tesla', 'Toyota',
+            'Abarth', 'Alfa Romeo', 'Aston Martin', 'Audi', 'Bentley', 'BMW', 'Bugatti',
+            'Cadillac', 'Chevrolet', 'Chrysler', 'Citroën', 'Citroen', 'Cupra', 'Dacia',
+            'Dodge', 'Ferrari', 'Fiat', 'Ford', 'Honda', 'Hummer', 'Hyundai', 'Infiniti',
+            'Jaguar', 'Jeep', 'Kia', 'Lamborghini', 'Lancia', 'Land Rover', 'Lexus',
+            'Maserati', 'Mazda', 'McLaren', 'Mercedes-Benz', 'Mercedes', 'MG', 'Mini',
+            'Mitsubishi', 'Nissan', 'Opel', 'Peugeot', 'Porsche', 'Renault', 'Rolls-Royce',
+            'Saab', 'Seat', 'Skoda', 'Smart', 'Subaru', 'Suzuki', 'Tesla', 'Toyota',
             'Volkswagen', 'VW', 'Volvo'
         ]
         
         title_upper = title.upper()
         
         for brand in common_brands:
-            if brand.upper() in title_upper:
-                # Try to extract model (word after brand)
-                # Use regex to find the brand and capture what comes after
-                pattern = re.compile(rf'\b{re.escape(brand)}\b\s+(\S+)', re.IGNORECASE)
+            brand_upper = brand.upper()
+            if brand_upper in title_upper:
+                # Find the position of the brand in the title
+                pattern = re.compile(rf'\b{re.escape(brand)}\b', re.IGNORECASE)
                 match = pattern.search(title)
+                
                 if match:
-                    model = match.group(1)
-                    # Clean up model (remove non-alphanumeric except dash)
-                    model = re.sub(r'[^\w\s-]', '', model).strip()
-                    return brand, model if model else None
+                    # Get text after the brand name
+                    after_brand = title[match.end():].strip()
+                    
+                    # Extract model (first word/phrase after brand)
+                    model_match = re.match(r'^[\s\-]*([A-Za-z0-9\-]+(?:\s+[A-Za-z0-9\-]+)?)', after_brand)
+                    if model_match:
+                        model = model_match.group(1).strip()
+                        # Clean up model
+                        model = re.sub(r'[^\w\s\-]', '', model).strip()
+                        if model and len(model) > 1:
+                            return brand, model
+                
                 return brand, None
         
         return None, None
