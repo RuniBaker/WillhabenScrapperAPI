@@ -116,7 +116,7 @@ class ScrapingLog(db.Model):
 class WillhabenScraper:
     """Scraper for willhaben.at car listings"""
     
-    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto"
+    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto" 
     
     def __init__(self, max_cars: int = 100):
         self.max_cars = max_cars
