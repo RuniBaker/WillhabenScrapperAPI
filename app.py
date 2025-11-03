@@ -4,11 +4,11 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 import pytz
-import requests
+import re
 
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import or_, and_, func
+from sqlalchemy import or_, and_, func, text
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -115,9 +115,9 @@ class ScrapingLog(db.Model):
 # ============================================================================
 
 class WillhabenScraper:
-    """Scraper for willhaben.at car listings"""
+    """Scraper for willhaben.at car listings - Simplified robust version"""
     
-    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
+    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?rows=30"
     
     def __init__(self, max_cars: int = 100):
         self.max_cars = max_cars
@@ -138,98 +138,127 @@ class WillhabenScraper:
                 
                 context = browser.new_context(
                     viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    locale='de-AT'
                 )
                 
                 page = context.new_page()
                 
                 logger.info(f"Navigating to {self.BASE_URL}")
-                page.goto(self.BASE_URL, wait_until="networkidle", timeout=60000)
+                page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=60000)
 
-                # Accept cookies
+                # Handle cookie consent - try multiple selectors
                 try:
-                    btn = page.query_selector('button#didomi-notice-agree-button, button[data-testid="uc-accept-all-button"]')
-                    if btn:
-                        btn.click()
-                        page.wait_for_timeout(1000)
-                        logger.info("Accepted cookie consent dialog")
-                except Exception:
-                    pass
-
-                # Click the 'Prikazano ... vozila' button to load listings
-                try:
-                    button = page.wait_for_selector("button[data-testid='search-submit-button']", timeout=10000)
-                    if button:
-                        button.click()
-                        logger.info("Clicked 'Prikazano ... vozila' button")
-                        page.wait_for_timeout(3000)
+                    page.wait_for_timeout(2000)
+                    cookie_selectors = [
+                        'button#didomi-notice-agree-button',
+                        'button[data-testid="uc-accept-all-button"]',
+                        'button:has-text("Akzeptieren")',
+                        'button:has-text("Alle akzeptieren")'
+                    ]
+                    for selector in cookie_selectors:
+                        try:
+                            btn = page.query_selector(selector)
+                            if btn and btn.is_visible():
+                                btn.click()
+                                page.wait_for_timeout(1000)
+                                logger.info(f"Accepted cookies using selector: {selector}")
+                                break
+                        except:
+                            continue
                 except Exception as e:
-                    logger.warning(f"Could not click 'Prikazano vozila' button: {e}")
+                    logger.info(f"No cookie dialog or already accepted: {e}")
 
-                # Scroll gradually to ensure lazy-loading
-                for i in range(5):
-                    page.mouse.wheel(0, 3000)
+                # Wait for page to fully load
+                page.wait_for_timeout(5000)
+                
+                # Scroll to trigger lazy loading
+                logger.info("Scrolling to load content...")
+                for i in range(3):
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
                     page.wait_for_timeout(2000)
 
-                # Wait for JS-rendered car listings to appear
-                try:
-                    page.wait_for_selector("article[data-testid='result-list-entry']", timeout=20000)
-                    logger.info("Car listing articles loaded")
-                except Exception as e:
-                    logger.warning(f"Car listing articles did not appear: {e}")
-
-                # Extract car listings
-                listing_elements = page.query_selector_all("article[data-testid='result-list-entry']")
-                logger.info(f"Found {len(listing_elements)} car listings")
-
+                # Try multiple strategies to find car listings
+                logger.info("Looking for car listings...")
+                
+                # Strategy 1: Find all links containing /gebrauchtwagen/
+                all_car_links = page.query_selector_all('a[href*="/gebrauchtwagen/"]')
+                logger.info(f"Strategy 1: Found {len(all_car_links)} links with /gebrauchtwagen/")
+                
+                # Strategy 2: Find article elements
+                articles = page.query_selector_all('article')
+                logger.info(f"Strategy 2: Found {len(articles)} article elements")
+                
+                # Strategy 3: Find any divs/sections that might contain listings
+                potential_containers = page.query_selector_all('[class*="ResultList"], [class*="SearchResult"], [data-testid*="result"]')
+                logger.info(f"Strategy 3: Found {len(potential_containers)} potential result containers")
+                
+                # Extract unique car listings
                 car_listings = []
                 seen_ids = set()
-                import re
-
-                for item in listing_elements:
+                
+                # Process links from Strategy 1
+                for link in all_car_links:
                     try:
-                        link = item.query_selector('a[href*="/iad/gebrauchtwagen/"]')
-                        if not link:
-                            continue
-
                         href = link.get_attribute('href')
                         if not href:
                             continue
 
+                        # Build full URL
                         if not href.startswith('http'):
-                            href = f"https://www.willhaben.at{href}"
+                            full_url = f"https://www.willhaben.at{href}"
+                        else:
+                            full_url = href
 
-                        # Extract numeric ID
-                        match = re.search(r'[-/](\d{6,})(?:\?|$)', href)
-                        if not match:
-                            # Try fallback for redirect or query parameter formats
-                            match = re.search(r'(?:adId|insertId|entryId)=(\d+)', href)
-                        if not match:
+                        # Extract numeric ID from URL
+                        # Patterns: /auto/bmw-123456789 or ?adId=123456789
+                        id_match = re.search(r'[-/](\d{6,})(?:[/?]|$)', href)
+                        if not id_match:
+                            id_match = re.search(r'(?:adId|insertId|entryId)=(\d+)', href)
+                        
+                        if not id_match:
                             continue
 
-                        listing_id = match.group(1)
+                        listing_id = id_match.group(1)
 
-                        if listing_id not in seen_ids:
-                            seen_ids.add(listing_id)
-                            car_listings.append({
-                                'link_element': link,
-                                'url': href,
-                                'listing_id': listing_id
-                            })
+                        # Skip if we've seen this ID or if it's not a car detail page
+                        if listing_id in seen_ids:
+                            continue
+                        
+                        # Make sure it's actually a car listing page, not category/search page
+                        if '/gebrauchtwagenboerse' in href or '/kategorie' in href:
+                            continue
+                            
+                        seen_ids.add(listing_id)
+                        car_listings.append({
+                            'link_element': link,
+                            'url': full_url,
+                            'listing_id': listing_id
+                        })
+                        
                     except Exception as e:
-                        logger.debug(f"Error processing listing: {str(e)}")
+                        logger.debug(f"Error processing link: {str(e)}")
                         continue
 
                 logger.info(f"Found {len(car_listings)} unique car listings")
-                if car_listings:
-                    logger.info(f"Example listing: {car_listings[0]['url']}")
-                
-                logger.info(f"Found {len(car_listings)} unique car listings")
                 
                 if len(car_listings) == 0:
-                    logger.warning("No car listings found! Page might not have loaded properly.")
+                    logger.warning("No car listings found! Saving debug screenshot...")
+                    try:
+                        page.screenshot(path="/tmp/debug_screenshot.png")
+                        # Also save HTML for debugging
+                        html_content = page.content()
+                        with open("/tmp/debug_page.html", "w", encoding="utf-8") as f:
+                            f.write(html_content)
+                        logger.info("Debug files saved: /tmp/debug_screenshot.png and /tmp/debug_page.html")
+                    except:
+                        pass
                     browser.close()
                     return cars
+                
+                # Show first few examples
+                for i, listing in enumerate(car_listings[:3]):
+                    logger.info(f"Example listing {i+1}: {listing['url']}")
                 
                 # Process each car listing
                 for idx, listing_data in enumerate(car_listings[:self.max_cars]):
@@ -238,97 +267,43 @@ class WillhabenScraper:
                         url = listing_data['url']
                         listing_id = listing_data['listing_id']
                         
-                        # Get text content from the link and its parent container
-                        link_text = link_element.inner_text().strip()
-                        
-                        # Try to get parent container with more info
+                        # Get text content
                         try:
-                            # Go up the DOM tree to find the card container
-                            parent = link_element.evaluate_handle('el => el.closest("article, [class*=\"Card\"], [class*=\"card\"], [class*=\"Item\"], [class*=\"item\"])')
-                            parent_element = parent.as_element() if parent else None
-                            
-                            if parent_element:
-                                text_content = parent_element.inner_text()
-                            else:
-                                # Fallback: go up 3 levels
-                                parent_el = link_element
-                                for _ in range(3):
-                                    parent_handle = parent_el.evaluate_handle('el => el.parentElement')
-                                    parent_el = parent_handle.as_element()
-                                    if not parent_el:
-                                        break
-                                text_content = parent_el.inner_text() if parent_el else link_text
+                            # Try to get the parent article/container for full info
+                            parent_handle = link_element.evaluate_handle(
+                                'el => el.closest("article") || el.closest("[class*=\'Card\']") || el.closest("[class*=\'Item\']") || el.parentElement.parentElement'
+                            )
+                            parent = parent_handle.as_element()
+                            text_content = parent.inner_text() if parent else link_element.inner_text()
                         except:
-                            text_content = link_text
+                            text_content = link_element.inner_text()
                         
-                        # Use link text as title, fallback to first line of content
-                        title = link_text if link_text and len(link_text) > 5 else text_content.split('\n')[0]
-                        title = title[:500]  # Limit length
+                        # Extract title
+                        link_text = link_element.inner_text().strip()
+                        title = link_text if len(link_text) > 5 else text_content.split('\n')[0]
+                        title = title[:500]
                         
-                        # Extract image - try multiple methods
+                        if not title or len(title) < 3:
+                            title = f"Car Listing {listing_id}"
+                        
+                        # Extract image
                         image_url = None
                         try:
-                            # Try to find img near the link
-                            img_handle = link_element.evaluate_handle('''el => {
-                                return el.querySelector('img') || 
-                                       el.parentElement?.querySelector('img') ||
-                                       el.parentElement?.parentElement?.querySelector('img');
-                            }''')
-                            img_element = img_handle.as_element() if img_handle else None
-                            
-                            if img_element:
-                                image_url = (img_element.get_attribute('src') or 
-                                           img_element.get_attribute('data-src') or
-                                           img_element.get_attribute('data-lazy-src'))
+                            img = link_element.query_selector('img')
+                            if not img and parent:
+                                img = parent.query_selector('img')
+                            if img:
+                                image_url = (img.get_attribute('src') or 
+                                           img.get_attribute('data-src') or
+                                           img.get_attribute('srcset', '').split()[0] if img.get_attribute('srcset') else None)
                         except:
                             pass
                         
-                        # Parse price from text
-                        price = None
-                        import re
-                        # Match patterns like "€ 15.900" or "15.900 €" or "€15900"
-                        price_patterns = [
-                            r'€\s*([\d.,]+)',
-                            r'([\d.,]+)\s*€',
-                        ]
-                        for pattern in price_patterns:
-                            price_match = re.search(pattern, text_content)
-                            if price_match:
-                                try:
-                                    price_str = price_match.group(1).replace('.', '').replace(',', '.')
-                                    price = float(price_str)
-                                    break
-                                except:
-                                    pass
-                        
-                        # Parse year (4-digit number starting with 19 or 20)
-                        year = None
-                        year_match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', text_content)
-                        if year_match:
-                            try:
-                                year_candidate = int(year_match.group(0))
-                                if 1990 <= year_candidate <= 2025:
-                                    year = year_candidate
-                            except:
-                                pass
-                        
-                        # Parse mileage (look for numbers followed by km)
-                        mileage = None
-                        mileage_match = re.search(r'([\d.]+)\s*km', text_content, re.IGNORECASE)
-                        if mileage_match:
-                            try:
-                                mileage_str = mileage_match.group(1).replace('.', '')
-                                mileage = int(mileage_str)
-                            except:
-                                pass
-                        
-                        # Parse location (Austrian postal codes are 4 digits + city name)
-                        location = None
-                        location_match = re.search(r'\b(\d{4}\s+[A-ZÄÖÜa-zäöüß\s-]+?)(?:\n|$)', text_content)
-                        if location_match:
-                            location = location_match.group(1).strip()[:200]
-                        
-                        # Parse brand and model from title
+                        # Parse data from text
+                        price = self._extract_price(text_content)
+                        year = self._extract_year(text_content)
+                        mileage = self._extract_mileage(text_content)
+                        location = self._extract_location(text_content)
                         brand, model = self._parse_brand_model(title)
                         
                         car_data = {
@@ -349,14 +324,14 @@ class WillhabenScraper:
                         }
                         
                         cars.append(car_data)
-                        logger.info(f"✓ Scraped {idx + 1}/{min(len(car_listings), self.max_cars)}: {title[:60]}... (€{price or '?'}, {year or '?'})")
+                        logger.info(f"✓ {idx + 1}/{min(len(car_listings), self.max_cars)}: {title[:50]}... €{price or '?'}")
                         
                     except Exception as e:
-                        logger.error(f"✗ Error extracting car {idx + 1} (ID: {listing_data.get('listing_id', '?')}): {str(e)}")
+                        logger.error(f"✗ Error extracting car {idx + 1}: {str(e)}")
                         continue
                 
                 browser.close()
-                logger.info(f"Scraping completed successfully: {len(cars)} cars extracted")
+                logger.info(f"Scraping completed: {len(cars)} cars extracted")
                 
         except Exception as e:
             logger.error(f"Scraping failed: {str(e)}")
@@ -365,57 +340,51 @@ class WillhabenScraper:
         
         return cars
     
-    def scrape_listings_json_api(self, max_cars: int = 100) -> List[Dict[str, Any]]:
-        """
-        Scrape car listings from Willhaben's internal JSON API
-        Returns list of car dictionaries
-        """
-        # Example endpoint and params (update these after inspecting DevTools)
-        api_url = "https://api.willhaben.at/restapi/api/v2/search/advertisement"  # Example, update as needed
-        params = {
-            "rows": max_cars,
-            "page": 1,
-            # Add other required params here
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-        }
-        try:
-            response = requests.get(api_url, params=params, headers=headers, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            # Parse car listings from JSON response
-            car_listings = []
-            for item in data.get("searchResults", []):  # Update key as needed
-                car = {
-                    "listing_id": item.get("id"),
-                    "title": item.get("title"),
-                    "price": item.get("price"),
-                    "currency": item.get("currency"),
-                    "brand": item.get("make"),
-                    "model": item.get("model"),
-                    "year": item.get("year"),
-                    "mileage": item.get("mileage"),
-                    "fuel_type": item.get("fuelType"),
-                    "transmission": item.get("transmission"),
-                    "location": item.get("location"),
-                    "image_url": item.get("imageUrl"),
-                    "url": item.get("url"),
-                    "description": item.get("description"),
-                }
-                car_listings.append(car)
-            logger.info(f"Fetched {len(car_listings)} cars from JSON API")
-            return car_listings
-        except Exception as e:
-            logger.error(f"Failed to fetch from JSON API: {str(e)}")
-            return []
+    def _extract_price(self, text: str) -> Optional[float]:
+        """Extract price from text"""
+        price_patterns = [r'€\s*([\d.,]+)', r'([\d.,]+)\s*€']
+        for pattern in price_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    price_str = match.group(1).replace('.', '').replace(',', '.')
+                    return float(price_str)
+                except:
+                    pass
+        return None
+    
+    def _extract_year(self, text: str) -> Optional[int]:
+        """Extract year from text"""
+        match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', text)
+        if match:
+            try:
+                year = int(match.group(0))
+                if 1990 <= year <= 2025:
+                    return year
+            except:
+                pass
+        return None
+    
+    def _extract_mileage(self, text: str) -> Optional[int]:
+        """Extract mileage from text"""
+        match = re.search(r'([\d.]+)\s*km', text, re.IGNORECASE)
+        if match:
+            try:
+                mileage_str = match.group(1).replace('.', '')
+                return int(mileage_str)
+            except:
+                pass
+        return None
+    
+    def _extract_location(self, text: str) -> Optional[str]:
+        """Extract location from text"""
+        match = re.search(r'\b(\d{4}\s+[A-ZÄÖÜa-zäöüß\s-]+?)(?:\n|$)', text)
+        if match:
+            return match.group(1).strip()[:200]
+        return None
     
     def _parse_brand_model(self, title: str) -> tuple:
-        """Enhanced brand/model parsing from title"""
-        import re
-        
-        # Extended list of car brands
+        """Parse brand and model from title"""
         common_brands = [
             'Abarth', 'Alfa Romeo', 'Aston Martin', 'Audi', 'Bentley', 'BMW', 'Bugatti',
             'Cadillac', 'Chevrolet', 'Chrysler', 'Citroën', 'Citroen', 'Cupra', 'Dacia',
@@ -430,32 +399,22 @@ class WillhabenScraper:
         title_upper = title.upper()
         
         for brand in common_brands:
-            brand_upper = brand.upper()
-            if brand_upper in title_upper:
-                # Find the position of the brand in the title
+            if brand.upper() in title_upper:
                 pattern = re.compile(rf'\b{re.escape(brand)}\b', re.IGNORECASE)
                 match = pattern.search(title)
                 
                 if match:
-                    # Get text after the brand name
                     after_brand = title[match.end():].strip()
-                    
-                    # Extract model (first word/phrase after brand)
                     model_match = re.match(r'^[\s\-]*([A-Za-z0-9\-]+(?:\s+[A-Za-z0-9\-]+)?)', after_brand)
                     if model_match:
                         model = model_match.group(1).strip()
-                        # Clean up model
                         model = re.sub(r'[^\w\s\-]', '', model).strip()
                         if model and len(model) > 1:
                             return brand, model
                 
                 return brand, None
-            
-            
         
         return None, None
-    
-    
 
 
 # ============================================================================
@@ -551,88 +510,11 @@ def cleanup_inactive_cars():
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-@app.route('/api/debug-links', methods=['GET'])
-def debug_links():
-    """Debug endpoint to see actual links found"""
-    try:
-        from playwright.sync_api import sync_playwright
-        
-        results = {
-            'status': 'running',
-            'all_links': [],
-            'car_links': [],
-            'errors': []
-        }
-        
-        url = request.args.get('url', 'https://www.willhaben.at/iad/kaufen-und-verkaufen/auto')
-        
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            )
-            page = context.new_page()
-            
-            # Navigate
-            page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            page.wait_for_timeout(7000)
-            
-            # Scroll
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(2000)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-            
-            # Get all links
-            all_links = page.query_selector_all('a[href*="/iad/"]')
-            
-            # Extract all hrefs
-            for link in all_links:
-                href = link.get_attribute('href')
-                if href:
-                    link_text = link.inner_text().strip()[:100]
-                    results['all_links'].append({
-                        'href': href,
-                        'text': link_text
-                    })
-            
-            # Filter car links
-            seen_ids = set()
-            for link_data in results['all_links']:
-                href = link_data['href']
-                parts = href.split('/')
-                
-                if 'auto' in href:
-                    potential_id = parts[-1].split('?')[0]
-                    if potential_id.isdigit() and potential_id not in seen_ids:
-                        seen_ids.add(potential_id)
-                        results['car_links'].append({
-                            'id': potential_id,
-                            'href': href,
-                            'text': link_data['text']
-                        })
-            
-            browser.close()
-        
-        results['status'] = 'completed'
-        results['total_links'] = len(results['all_links'])
-        results['total_car_links'] = len(results['car_links'])
-        
-        return jsonify(results), 200
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'failed',
-            'error': str(e)
-        }), 500
-     
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     try:
-        # Check database connection - fixed SQLAlchemy syntax
-        from sqlalchemy import text
         db.session.execute(text('SELECT 1'))
         return jsonify({
             'status': 'healthy',
@@ -653,14 +535,9 @@ def get_cars():
     try:
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 20, type=int)
-        
-        # Limit max results per page
         limit = min(limit, 100)
         
-        # Query active cars
         query = Car.query.filter_by(is_active=True).order_by(Car.first_seen_at.desc())
-        
-        # Paginate
         pagination = query.paginate(page=page, per_page=limit, error_out=False)
         
         return jsonify({
@@ -674,7 +551,6 @@ def get_cars():
                 'has_prev': pagination.has_prev
             }
         }), 200
-        
     except Exception as e:
         logger.error(f"Error in get_cars: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -685,12 +561,9 @@ def get_car(listing_id):
     """Get single car by listing ID"""
     try:
         car = Car.query.filter_by(listing_id=listing_id, is_active=True).first()
-        
         if not car:
             return jsonify({'error': 'Car not found'}), 404
-        
         return jsonify({'car': car.to_dict()}), 200
-        
     except Exception as e:
         logger.error(f"Error in get_car: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -700,7 +573,6 @@ def get_car(listing_id):
 def search_cars():
     """Search cars with filters"""
     try:
-        # Get query parameters
         brand = request.args.get('brand')
         model = request.args.get('model')
         min_price = request.args.get('min_price', type=float)
@@ -710,7 +582,6 @@ def search_cars():
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 20, type=int)
         
-        # Build query
         query = Car.query.filter_by(is_active=True)
         
         if brand:
@@ -727,8 +598,6 @@ def search_cars():
             query = query.filter(Car.year <= max_year)
         
         query = query.order_by(Car.first_seen_at.desc())
-        
-        # Paginate
         limit = min(limit, 100)
         pagination = query.paginate(page=page, per_page=limit, error_out=False)
         
@@ -751,7 +620,6 @@ def search_cars():
                 'has_prev': pagination.has_prev
             }
         }), 200
-        
     except Exception as e:
         logger.error(f"Error in search_cars: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -777,7 +645,6 @@ def get_recent_cars():
             'count': len(cars),
             'cutoff_time': cutoff_time.isoformat()
         }), 200
-        
     except Exception as e:
         logger.error(f"Error in get_recent_cars: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -789,7 +656,6 @@ def get_stats():
     try:
         total_cars = Car.query.filter_by(is_active=True).count()
         total_brands = db.session.query(func.count(func.distinct(Car.brand))).scalar()
-        
         recent_scrape = ScrapingLog.query.order_by(ScrapingLog.scrape_started_at.desc()).first()
         
         stats = {
@@ -801,7 +667,6 @@ def get_stats():
         }
         
         return jsonify(stats), 200
-        
     except Exception as e:
         logger.error(f"Error in get_stats: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -809,7 +674,7 @@ def get_stats():
 
 @app.route('/api/trigger-scrape', methods=['POST'])
 def trigger_scrape():
-    """Manual trigger for scraping (useful for testing)"""
+    """Manual trigger for scraping"""
     try:
         scrape_and_store_cars()
         return jsonify({'message': 'Scraping job triggered successfully'}), 200
@@ -817,86 +682,6 @@ def trigger_scrape():
         logger.error(f"Error triggering scrape: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/test-scrape', methods=['GET'])
-def test_scrape():
-    """Test scraping endpoint with detailed logging"""
-    try:
-        from playwright.sync_api import sync_playwright
-        
-        results = {
-            'status': 'running',
-            'steps': [],
-            'errors': []
-        }
-        
-        # Get custom URL from query param or use default
-        url = request.args.get('url', 'https://www.willhaben.at/iad/kaufen-und-verkaufen/auto')
-        results['url'] = url
-        
-        with sync_playwright() as p:
-            results['steps'].append('Playwright started')
-            
-            browser = p.chromium.launch(headless=True)
-            results['steps'].append('Browser launched')
-            
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-            page = context.new_page()
-            results['steps'].append('Page created')
-            
-            # Navigate
-            results['steps'].append(f'Navigating to {url}')
-            response = page.goto(url, wait_until='networkidle', timeout=60000)
-            results['steps'].append(f'Navigation complete - Status: {response.status}')
-            
-            # Wait a bit
-            page.wait_for_timeout(10000)
-            results['steps'].append('Waited 3 seconds')
-            
-            # Get page title
-            title = page.title()
-            results['page_title'] = title
-            results['steps'].append(f'Page title: {title}')
-            
-            # Try to find listings with different selectors
-            selectors_to_try = [
-                '[data-testid="search-result-entry"]',
-                '.search-result-entry',
-                'article',
-                '[class*="SearchResult"]',
-                '[class*="search"]',
-                'a[href*="/iad/"]'
-            ]
-            
-            for selector in selectors_to_try:
-                count = page.locator(selector).count()
-                results['steps'].append(f'Selector "{selector}": {count} elements found')
-            
-            # Get page content sample (first 500 chars)
-            content = page.content()
-            results['html_sample'] = content[:500]
-            results['html_length'] = len(content)
-            
-            # Take a screenshot (base64)
-            screenshot = page.screenshot()
-            import base64
-            results['screenshot_base64'] = base64.b64encode(screenshot).decode('utf-8')
-            
-            browser.close()
-            results['steps'].append('Browser closed')
-        
-        results['status'] = 'completed'
-        return jsonify(results), 200
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'failed',
-            'error': str(e),
-            'error_type': type(e).__name__
-        }), 500
-    
 
 # ============================================================================
 # SCHEDULER SETUP
@@ -906,7 +691,6 @@ def init_scheduler():
     """Initialize APScheduler with background jobs"""
     scheduler = BackgroundScheduler(timezone='UTC')
     
-    # Background scraper - every 5 minutes
     scheduler.add_job(
         func=scrape_and_store_cars,
         trigger=IntervalTrigger(minutes=5),
@@ -915,8 +699,6 @@ def init_scheduler():
         replace_existing=True
     )
     
-    # Daily cleanup at 00:00 CET (23:00 UTC in winter, 22:00 UTC in summer)
-    # Using 23:00 UTC for simplicity
     scheduler.add_job(
         func=cleanup_inactive_cars,
         trigger=CronTrigger(hour=23, minute=0),
@@ -926,9 +708,7 @@ def init_scheduler():
     )
     
     scheduler.start()
-    logger.info("Scheduler started with jobs: scrape_job (every 5 min), cleanup_job (daily at 00:00 CET)")
-    
-    # Shut down the scheduler when exiting the app
+    logger.info("Scheduler started")
     atexit.register(lambda: scheduler.shutdown())
     
     return scheduler
@@ -941,11 +721,9 @@ def init_scheduler():
 def init_app():
     """Initialize the application"""
     with app.app_context():
-        # Create tables
         db.create_all()
         logger.info("Database tables created")
         
-        # Check if we have any cars, if not run initial scrape
         car_count = Car.query.count()
         if car_count == 0:
             logger.info("No cars in database, running initial scrape...")
@@ -957,22 +735,10 @@ def init_app():
 
 # Initialize on startup
 if __name__ != '__main__':
-    # Running with gunicorn
     init_app()
     scheduler = init_scheduler()
 
-
 if __name__ == '__main__':
-    # Running directly with python
     init_app()
     scheduler = init_scheduler()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
-
-@app.route("/api/debug-html", methods=["GET"])
-def debug_html():
-    """Return the dumped Playwright HTML for debugging"""
-    import pathlib
-    path = pathlib.Path("/tmp/debug.html")
-    if path.exists():
-        return app.response_class(path.read_text("utf-8"), mimetype="text/html")
-    return jsonify({"error": "No debug file found"}), 404
