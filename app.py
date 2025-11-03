@@ -119,9 +119,9 @@ class WillhabenScraper:
     
     BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?rows=30"
     
-    def __init__(self, max_cars: int = 100, full_image_scraping: bool = True):
+    def __init__(self, max_cars: int = 100, full_image_scraping: bool = False):
         self.max_cars = max_cars
-        self.full_image_scraping = full_image_scraping
+        self.full_image_scraping = full_image_scraping  # Disabled by default for speed
     
     def scrape_listings(self) -> List[Dict[str, Any]]:
         """
@@ -170,14 +170,14 @@ class WillhabenScraper:
                 except Exception as e:
                     logger.info(f"No cookie dialog or already accepted: {e}")
 
-                # Wait for page to fully load
-                page.wait_for_timeout(10000)  # Wait 10 seconds for JS to load images
+                # Wait for page to fully load - reduced for speed
+                page.wait_for_timeout(3000)  # Wait 3 seconds for initial load
                 
-                # Scroll to trigger lazy loading
+                # Scroll to trigger lazy loading - reduced for speed
                 logger.info("Scrolling to load content...")
-                for i in range(5):  # Scroll more to trigger more lazy-loaded images
+                for i in range(2):  # Minimal scrolling for speed
                     page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1000)
 
                 # Try multiple strategies to find car listings
                 logger.info("Looking for car listings...")
@@ -287,7 +287,7 @@ class WillhabenScraper:
                         if not title or len(title) < 3:
                             title = f"Car Listing {listing_id}"
                         
-                        # Extract image
+                        # Extract thumbnail only for speed
                         image_url = None
                         try:
                             img = link_element.query_selector('img')
@@ -296,17 +296,13 @@ class WillhabenScraper:
                             if img:
                                 image_url = (img.get_attribute('src') or 
                                            img.get_attribute('data-src') or
+                                           img.get_attribute('data-lazy-src') or
                                            img.get_attribute('srcset', '').split()[0] if img.get_attribute('srcset') else None)
                         except:
                             pass
                         
-                        # Extract image gallery if full_image_scraping is enabled
-                        image_urls = []
-                        if self.full_image_scraping:
-                            image_urls = self.scrape_car_images(page, url)
-                        
-                        if not image_urls:
-                            image_urls = [image_url] if image_url else []
+                        # Store as array for consistency
+                        image_urls = [image_url] if image_url else []
 
                         # Initialize variables to avoid undefined errors
                         price = self._extract_price(text_content)
@@ -500,7 +496,8 @@ def scrape_and_store_cars():
         try:
             logger.info("Starting background scraping job...")
             
-            scraper = WillhabenScraper(max_cars=100)
+            # Optimize for maximum cars and speed
+            scraper = WillhabenScraper(max_cars=200, full_image_scraping=False)
             scraped_cars = scraper.scrape_listings()
             
             log_entry.cars_found = len(scraped_cars)
@@ -603,13 +600,14 @@ def health_check():
 
 @app.route('/api/cars', methods=['GET'])
 def get_cars():
-    """Get paginated list of cars"""
+    """Get paginated list of cars - sorted by most recent first"""
     try:
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 20, type=int)
         limit = min(limit, 100)
         
-        query = Car.query.filter_by(is_active=True).order_by(Car.first_seen_at.desc())
+        # Sort by last_seen_at to show most recently updated cars first
+        query = Car.query.filter_by(is_active=True).order_by(Car.last_seen_at.desc(), Car.first_seen_at.desc())
         pagination = query.paginate(page=page, per_page=limit, error_out=False)
         
         return jsonify({
@@ -697,20 +695,43 @@ def search_cars():
         return jsonify({'error': 'Internal server error'}), 500
 
 
+@app.route('/api/cars/latest', methods=['GET'])
+def get_latest_car():
+    """Get the single most recent car uploaded"""
+    try:
+        # Get the most recently seen car
+        latest_car = Car.query.filter_by(is_active=True).order_by(
+            Car.last_seen_at.desc(), 
+            Car.first_seen_at.desc()
+        ).first()
+        
+        if not latest_car:
+            return jsonify({'error': 'No cars found'}), 404
+        
+        return jsonify({
+            'car': latest_car.to_dict(),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in get_latest_car: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
 @app.route('/api/cars/recent', methods=['GET'])
 def get_recent_cars():
-    """Get cars added in the last 24 hours"""
+    """Get most recently seen cars (within last 24 hours or most recent)"""
     try:
         cutoff_time = datetime.utcnow() - timedelta(hours=24)
         limit = request.args.get('limit', 20, type=int)
         limit = min(limit, 100)
         
+        # Sort by last_seen_at to show the most freshly scraped cars
         cars = Car.query.filter(
             and_(
                 Car.is_active == True,
                 Car.first_seen_at >= cutoff_time
             )
-        ).order_by(Car.first_seen_at.desc()).limit(limit).all()
+        ).order_by(Car.last_seen_at.desc(), Car.first_seen_at.desc()).limit(limit).all()
         
         return jsonify({
             'cars': [car.to_dict() for car in cars],
@@ -765,9 +786,9 @@ def init_scheduler():
     
     scheduler.add_job(
         func=scrape_and_store_cars,
-        trigger=IntervalTrigger(minutes=1),  # Reduced interval to 1 minute
+        trigger=IntervalTrigger(seconds=5),  # Scrape every 5 seconds for maximum freshness
         id='scrape_job',
-        name='Scrape cars every 1 minute',
+        name='Scrape cars every 5 seconds',
         replace_existing=True
     )
     
