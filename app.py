@@ -143,29 +143,28 @@ class WillhabenScraper:
                 page = context.new_page()
                 
                 logger.info(f"Navigating to {self.BASE_URL}")
-                page.goto(self.BASE_URL, wait_until='domcontentloaded', timeout=30000)
-                
-                # Wait for JavaScript to render
-                logger.info("Waiting for dynamic content to load...")
-                page.wait_for_timeout(7000)
-                
-                # Wait for JavaScript to render
-                logger.info("Waiting for dynamic content to load...")
-                page.wait_for_timeout(7000)
-                
-                # Scroll to load more content
-                logger.info("Scrolling page to trigger lazy loading...")
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                page.wait_for_timeout(2000)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2000)
-                
-                logger.info("Extracting car listing links...")
+                page.goto(self.BASE_URL, wait_until="networkidle", timeout=60000)
 
-                # Find listing containers
-                listing_elements = page.query_selector_all('[data-testid="search-result-entry"], article')
+                # Accept cookies
+                try:
+                    btn = page.query_selector('button#didomi-notice-agree-button, button[data-testid="uc-accept-all-button"]')
+                    if btn:
+                        btn.click()
+                        page.wait_for_timeout(1000)
+                        logger.info("Accepted cookie consent dialog")
+                except Exception:
+                    pass
 
-                logger.info(f"Found {len(listing_elements)} potential listing containers")
+                # Wait for the results container
+                try:
+                    page.wait_for_selector('[data-testid="result-list"]', timeout=15000)
+                    logger.info("Result list container loaded")
+                except PlaywrightTimeout:
+                    logger.warning("Result list container did not appear in time")
+
+                # Now query for listings
+                listing_elements = page.query_selector_all('[data-testid="result-list"] article')
+                logger.info(f"Found {len(listing_elements)} listing <article> elements")
 
                 car_listings = []
                 seen_ids = set()
