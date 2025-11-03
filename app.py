@@ -64,7 +64,7 @@ class Car(db.Model):
     fuel_type = db.Column(db.String(50))
     transmission = db.Column(db.String(50))
     location = db.Column(db.String(200))
-    image_url = db.Column(db.Text)
+    image_urls = db.Column(db.JSON)  # Store array of image URLs
     url = db.Column(db.Text, nullable=False)
     description = db.Column(db.Text)
     first_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -88,7 +88,7 @@ class Car(db.Model):
             'fuel_type': self.fuel_type,
             'transmission': self.transmission,
             'location': self.location,
-            'image_url': self.image_url,
+            'image_urls': self.image_urls,  # Returns array like ["url1", "url2", ...]
             'url': self.url,
             'description': self.description,
             'first_seen_at': self.first_seen_at.isoformat() if self.first_seen_at else None,
@@ -287,7 +287,7 @@ class WillhabenScraper:
                             title = f"Car Listing {listing_id}"
                         
                         # Extract image - IMPROVED VERSION
-                        image_url = None
+                        image_urls = []
                         try:
                             img = None
                             
@@ -365,7 +365,35 @@ class WillhabenScraper:
                                     else:
                                         logger.debug(f"Found image for {listing_id}: {image_url[:80]}...")
                             
-                            if not image_url:
+                            if image_url:
+                                image_urls.append(image_url)
+                            
+                            # Try to find additional images if available
+                            try:
+                                # Method 4: Check for gallery or additional image elements
+                                additional_images = link_element.query_selector_all('img[data-src], img[srcset]')
+                                for img in additional_images:
+                                    img_url = img.get_attribute('src') or img.get_attribute('data-src')
+                                    if img_url:
+                                        # Fix relative URLs
+                                        if img_url.startswith('//'):
+                                            img_url = f"https:{img_url}"
+                                        elif img_url.startswith('/') and not img_url.startswith('//'):
+                                            img_url = f"https://www.willhaben.at{img_url}"
+                                        elif not img_url.startswith('http'):
+                                            img_url = f"https://www.willhaben.at/{img_url}"
+                                        
+                                        # Skip placeholder images
+                                        lower_url = img_url.lower()
+                                        if 'placeholder' in lower_url or 'icon' in lower_url or img_url.endswith('.svg'):
+                                            continue
+                                        
+                                        image_urls.append(img_url)
+                            
+                            except Exception as e:
+                                logger.debug(f"Error finding additional images: {str(e)}")
+                            
+                            if not image_urls:
                                 logger.warning(f"No image found for listing {listing_id}")
                                         
                         except Exception as e:
@@ -379,6 +407,17 @@ class WillhabenScraper:
                         location = self._extract_location(text_content)
                         brand, model = self._parse_brand_model(title)
                         
+                        # Get all images from detail page
+                        image_urls = self.scrape_car_images(page, url)
+
+                        # If no images found, try to get at least thumbnail
+                        if not image_urls:
+                            # Use your existing thumbnail extraction code
+                            if image_url:  # from your existing code
+                                image_urls = [image_url]
+                            else:
+                                image_urls = []
+
                         car_data = {
                             'listing_id': listing_id,
                             'title': title,
@@ -391,7 +430,7 @@ class WillhabenScraper:
                             'fuel_type': None,
                             'transmission': None,
                             'location': location,
-                            'image_url': image_url,
+                            'image_urls': image_urls,  # Array instead of single URL
                             'url': url,
                             'description': text_content[:500] if text_content else title,
                         }
@@ -488,6 +527,66 @@ class WillhabenScraper:
                 return brand, None
         
         return None, None
+    
+    def scrape_car_images(self, page, car_url: str) -> List[str]:
+        """
+        Visit car detail page and extract all images from gallery
+        """
+        images = []
+        
+        try:
+            logger.info(f"Fetching images from detail page: {car_url}")
+            page.goto(car_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+            
+            # Try multiple selectors for image galleries
+            image_selectors = [
+                'img[class*="gallery"]',
+                '[class*="ImageGallery"] img',
+                '[class*="Carousel"] img',
+                '[data-testid*="image"] img',
+                'picture img',
+                '.image-gallery img'
+            ]
+            
+            seen_urls = set()
+            
+            for selector in image_selectors:
+                img_elements = page.query_selector_all(selector)
+                for img in img_elements:
+                    url = (
+                        img.get_attribute('src') or 
+                        img.get_attribute('data-src') or
+                        img.get_attribute('data-original')
+                    )
+                    
+                    # Handle srcset
+                    if not url:
+                        srcset = img.get_attribute('srcset')
+                        if srcset:
+                            # Get highest resolution image
+                            urls = [s.strip().split()[0] for s in srcset.split(',')]
+                            if urls:
+                                url = urls[-1]  # Last one is usually highest res
+                    
+                    if url and url not in seen_urls:
+                        # Fix relative URLs
+                        if url.startswith('//'):
+                            url = f"https:{url}"
+                        elif url.startswith('/'):
+                            url = f"https://www.willhaben.at{url}"
+                        
+                        # Skip thumbnails and icons
+                        if 'thumb' not in url.lower() and 'icon' not in url.lower() and not url.endswith('.svg'):
+                            images.append(url)
+                            seen_urls.add(url)
+            
+            logger.info(f"Found {len(images)} images for car")
+            return images[:10]  # Limit to 10 images max
+            
+        except Exception as e:
+            logger.error(f"Error scraping images from {car_url}: {str(e)}")
+            return []
 
 
 # ============================================================================
