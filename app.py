@@ -156,22 +156,31 @@ class WillhabenScraper:
                 except Exception:
                     pass
 
-                # Wait for the results container
+                # Click the 'Prikazano ... vozila' button to load listings
                 try:
-                    page.wait_for_selector('[data-testid="result-list"]', timeout=15000)
-                    logger.info("Result list container loaded")
-                except PlaywrightTimeout:
-                    logger.warning("Result list container did not appear in time")
+                    button = page.wait_for_selector("button[data-testid='search-submit-button']", timeout=10000)
+                    if button:
+                        button.click()
+                        logger.info("Clicked 'Prikazano ... vozila' button")
+                        page.wait_for_timeout(3000)
+                except Exception as e:
+                    logger.warning(f"Could not click 'Prikazano vozila' button: {e}")
 
-                # Dump the rendered HTML for inspection
-                html = page.content()
-                with open("/tmp/debug.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                logger.info("Dumped page HTML to /tmp/debug.html")
+                # Scroll gradually to ensure lazy-loading
+                for i in range(5):
+                    page.mouse.wheel(0, 3000)
+                    page.wait_for_timeout(2000)
 
-                # Now query for listings
-                listing_elements = page.query_selector_all('[data-testid="result-list"] article')
-                logger.info(f"Found {len(listing_elements)} listing <article> elements")
+                # Wait for JS-rendered car listings to appear
+                try:
+                    page.wait_for_selector("article[data-testid='result-list-entry']", timeout=20000)
+                    logger.info("Car listing articles loaded")
+                except Exception as e:
+                    logger.warning(f"Car listing articles did not appear: {e}")
+
+                # Extract car listings
+                listing_elements = page.query_selector_all("article[data-testid='result-list-entry']")
+                logger.info(f"Found {len(listing_elements)} car listings")
 
                 car_listings = []
                 seen_ids = set()
