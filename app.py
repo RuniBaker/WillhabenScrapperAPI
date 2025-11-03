@@ -777,11 +777,11 @@ def test_scrape():
             
             # Navigate
             results['steps'].append(f'Navigating to {url}')
-            response = page.goto(url, wait_until='networkidle', timeout=30000)
+            response = page.goto(url, wait_until='networkidle', timeout=60000)
             results['steps'].append(f'Navigation complete - Status: {response.status}')
             
             # Wait a bit
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(10000)
             results['steps'].append('Waited 3 seconds')
             
             # Get page title
