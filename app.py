@@ -119,8 +119,9 @@ class WillhabenScraper:
     
     BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?rows=30"
     
-    def __init__(self, max_cars: int = 100):
+    def __init__(self, max_cars: int = 100, full_image_scraping: bool = True):
         self.max_cars = max_cars
+        self.full_image_scraping = full_image_scraping
     
     def scrape_listings(self) -> List[Dict[str, Any]]:
         """
@@ -286,137 +287,33 @@ class WillhabenScraper:
                         if not title or len(title) < 3:
                             title = f"Car Listing {listing_id}"
                         
-                        # Extract image - IMPROVED VERSION
-                        image_urls = []
+                        # Extract image
+                        image_url = None
                         try:
-                            img = None
-                            
-                            # Try to find img element using multiple methods
-                            if not img:
-                                # Method 1: Direct query in link
-                                img = link_element.query_selector('img')
-                            
+                            img = link_element.query_selector('img')
                             if not img and parent:
-                                # Method 2: Query in parent container
                                 img = parent.query_selector('img')
-                            
-                            if not img:
-                                # Method 3: Use JavaScript to search more broadly
-                                try:
-                                    img_handle = link_element.evaluate_handle('''el => {
-                                        // Look for img in various containers
-                                        let container = el.closest('article') || 
-                                                       el.closest('[class*="Card"]') || 
-                                                       el.closest('[data-testid*="result"]') ||
-                                                       el.parentElement?.parentElement?.parentElement;
-                                        
-                                        if (container) {
-                                            // Try to find img
-                                            let img = container.querySelector('img');
-                                            if (img) return img;
-                                            
-                                            // Try to find picture > img
-                                            let picture = container.querySelector('picture');
-                                            if (picture) {
-                                                img = picture.querySelector('img');
-                                                if (img) return img;
-                                            }
-                                        }
-                                        return null;
-                                    }''')
-                                    img = img_handle.as_element() if img_handle else None
-                                except Exception as je:
-                                    logger.debug(f"JS image search failed: {je}")
-                            
-                            # Extract image URL from element
                             if img:
-                                # Try multiple attributes
-                                image_url = (
-                                    img.get_attribute('src') or 
-                                    img.get_attribute('data-src') or 
-                                    img.get_attribute('data-lazy-src') or
-                                    img.get_attribute('data-original') or
-                                    img.get_attribute('data-lazy')
-                                )
-                                
-                                # Try srcset if nothing found
-                                if not image_url:
-                                    srcset = img.get_attribute('srcset')
-                                    if srcset:
-                                        # Get first URL from srcset
-                                        parts = srcset.split(',')
-                                        if parts:
-                                            first_url = parts[0].strip().split()[0]
-                                            image_url = first_url
-                                
-                                # Fix relative URLs
-                                if image_url:
-                                    if image_url.startswith('//'):
-                                        image_url = f"https:{image_url}"
-                                    elif image_url.startswith('/') and not image_url.startswith('//'):
-                                        image_url = f"https://www.willhaben.at{image_url}"
-                                    elif not image_url.startswith('http'):
-                                        image_url = f"https://www.willhaben.at/{image_url}"
-                                    
-                                    # Skip placeholder images
-                                    lower_url = image_url.lower()
-                                    if 'placeholder' in lower_url or 'icon' in lower_url or image_url.endswith('.svg'):
-                                        image_url = None
-                                    else:
-                                        logger.debug(f"Found image for {listing_id}: {image_url[:80]}...")
-                            
-                            if image_url:
-                                image_urls.append(image_url)
-                            
-                            # Try to find additional images if available
-                            try:
-                                # Method 4: Check for gallery or additional image elements
-                                additional_images = link_element.query_selector_all('img[data-src], img[srcset]')
-                                for img in additional_images:
-                                    img_url = img.get_attribute('src') or img.get_attribute('data-src')
-                                    if img_url:
-                                        # Fix relative URLs
-                                        if img_url.startswith('//'):
-                                            img_url = f"https:{img_url}"
-                                        elif img_url.startswith('/') and not img_url.startswith('//'):
-                                            img_url = f"https://www.willhaben.at{img_url}"
-                                        elif not img_url.startswith('http'):
-                                            img_url = f"https://www.willhaben.at/{img_url}"
-                                        
-                                        # Skip placeholder images
-                                        lower_url = img_url.lower()
-                                        if 'placeholder' in lower_url or 'icon' in lower_url or img_url.endswith('.svg'):
-                                            continue
-                                        
-                                        image_urls.append(img_url)
-                            
-                            except Exception as e:
-                                logger.debug(f"Error finding additional images: {str(e)}")
-                            
-                            if not image_urls:
-                                logger.warning(f"No image found for listing {listing_id}")
-                                        
-                        except Exception as e:
-                            logger.warning(f"Image extraction error for {listing_id}: {str(e)}")
+                                image_url = (img.get_attribute('src') or 
+                                           img.get_attribute('data-src') or
+                                           img.get_attribute('srcset', '').split()[0] if img.get_attribute('srcset') else None)
+                        except:
                             pass
                         
-                        # Parse data from text
+                        # Extract image gallery if full_image_scraping is enabled
+                        image_urls = []
+                        if self.full_image_scraping:
+                            image_urls = self.scrape_car_images(page, url)
+                        
+                        if not image_urls:
+                            image_urls = [image_url] if image_url else []
+
+                        # Initialize variables to avoid undefined errors
                         price = self._extract_price(text_content)
                         year = self._extract_year(text_content)
                         mileage = self._extract_mileage(text_content)
                         location = self._extract_location(text_content)
                         brand, model = self._parse_brand_model(title)
-                        
-                        # Get all images from detail page
-                        image_urls = self.scrape_car_images(page, url)
-
-                        # If no images found, try to get at least thumbnail
-                        if not image_urls:
-                            # Use your existing thumbnail extraction code
-                            if image_url:  # from your existing code
-                                image_urls = [image_url]
-                            else:
-                                image_urls = []
 
                         car_data = {
                             'listing_id': listing_id,
@@ -630,13 +527,16 @@ def scrape_and_store_cars():
                     cars_added += 1
             
             # Mark cars as inactive if not seen in this scrape
-            if current_listing_ids:
-                Car.query.filter(
+            if current_listing_ids and len(scraped_cars) > 10:  # Safeguard: Only deactivate if >10 cars scraped
+                inactive_count = Car.query.filter(
                     and_(
                         Car.listing_id.notin_(current_listing_ids),
                         Car.is_active == True
                     )
                 ).update({'is_active': False}, synchronize_session=False)
+                logger.info(f"Marked {inactive_count} cars as inactive")
+            else:
+                logger.warning("Skipping deactivation: Too few cars scraped or scrape failed")
             
             db.session.commit()
             
