@@ -920,6 +920,18 @@ def init_app():
         db.create_all()
         logger.info("Database tables created")
         
+        # Run migration to add posted_at column if it doesn't exist
+        try:
+            db.session.execute(text("""
+                ALTER TABLE cars 
+                ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP
+            """))
+            db.session.commit()
+            logger.info("Database migration: posted_at column added/verified")
+        except Exception as e:
+            logger.warning(f"Migration may have already run or failed: {e}")
+            db.session.rollback()
+        
         car_count = Car.query.count()
         if car_count == 0:
             logger.info("No cars in database, running initial scrape...")
