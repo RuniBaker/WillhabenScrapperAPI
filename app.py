@@ -116,7 +116,7 @@ class ScrapingLog(db.Model):
 class WillhabenScraper:
     """Scraper for willhaben.at car listings"""
     
-    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto" 
+    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
     
     def __init__(self, max_cars: int = 100):
         self.max_cars = max_cars
@@ -144,18 +144,6 @@ class WillhabenScraper:
                 
                 logger.info(f"Navigating to {self.BASE_URL}")
                 page.goto(self.BASE_URL, wait_until='domcontentloaded', timeout=30000)
-                logger.info("Waiting for search button to appear...")
-                try:
-                    page.wait_for_selector('button[data-testid="search-submit-button"]', timeout=10000)
-                    button = page.query_selector('button[data-testid="search-submit-button"]')
-                    if button:
-                        logger.info("Clicking 'Prikazano vozila' button to load listings...")
-                        button.click()
-                        page.wait_for_timeout(5000)
-                    else:
-                        logger.warning("Search button not found on page.")
-                except PlaywrightTimeout:
-                    logger.warning("Search button did not appear in time.")
                 
                 # Wait for JavaScript to render
                 logger.info("Waiting for dynamic content to load...")
