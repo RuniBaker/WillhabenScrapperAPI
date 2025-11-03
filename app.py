@@ -164,6 +164,14 @@ class WillhabenScraper:
                 logger.info("Extracting car listing links...")
                 all_links = page.query_selector_all('a[href*="/iad/"]')
                 logger.info(f"Found {len(all_links)} total /iad/ links")
+
+                # DEBUG: Show a few sample hrefs to understand why none match
+                sample_hrefs = []
+                for link in all_links[:10]:
+                    href = link.get_attribute('href')
+                    if href:
+                        sample_hrefs.append(href)
+                logger.info(f"Sample hrefs: {sample_hrefs}")
                 
                 import re
 
