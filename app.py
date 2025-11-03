@@ -765,9 +765,9 @@ def init_scheduler():
     
     scheduler.add_job(
         func=scrape_and_store_cars,
-        trigger=IntervalTrigger(minutes=5),
+        trigger=IntervalTrigger(minutes=1),  # Reduced interval to 1 minute
         id='scrape_job',
-        name='Scrape cars every 5 minutes',
+        name='Scrape cars every 1 minute',
         replace_existing=True
     )
     
