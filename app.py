@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 import pytz
+import requests
 
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
@@ -354,6 +355,52 @@ class WillhabenScraper:
             logger.error(traceback.format_exc())
         
         return cars
+    
+    def scrape_listings_json_api(self, max_cars: int = 100) -> List[Dict[str, Any]]:
+        """
+        Scrape car listings from Willhaben's internal JSON API
+        Returns list of car dictionaries
+        """
+        # Example endpoint and params (update these after inspecting DevTools)
+        api_url = "https://api.willhaben.at/restapi/api/v2/search/advertisement"  # Example, update as needed
+        params = {
+            "rows": max_cars,
+            "page": 1,
+            # Add other required params here
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        }
+        try:
+            response = requests.get(api_url, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            # Parse car listings from JSON response
+            car_listings = []
+            for item in data.get("searchResults", []):  # Update key as needed
+                car = {
+                    "listing_id": item.get("id"),
+                    "title": item.get("title"),
+                    "price": item.get("price"),
+                    "currency": item.get("currency"),
+                    "brand": item.get("make"),
+                    "model": item.get("model"),
+                    "year": item.get("year"),
+                    "mileage": item.get("mileage"),
+                    "fuel_type": item.get("fuelType"),
+                    "transmission": item.get("transmission"),
+                    "location": item.get("location"),
+                    "image_url": item.get("imageUrl"),
+                    "url": item.get("url"),
+                    "description": item.get("description"),
+                }
+                car_listings.append(car)
+            logger.info(f"Fetched {len(car_listings)} cars from JSON API")
+            return car_listings
+        except Exception as e:
+            logger.error(f"Failed to fetch from JSON API: {str(e)}")
+            return []
     
     def _parse_brand_model(self, title: str) -> tuple:
         """Enhanced brand/model parsing from title"""
