@@ -144,6 +144,22 @@ class WillhabenScraper:
                 
                 logger.info(f"Navigating to {self.BASE_URL}")
                 page.goto(self.BASE_URL, wait_until='domcontentloaded', timeout=30000)
+                logger.info("Waiting for search button to appear...")
+                try:
+                    page.wait_for_selector('button[data-testid="search-submit-button"]', timeout=10000)
+                    button = page.query_selector('button[data-testid="search-submit-button"]')
+                    if button:
+                        logger.info("Clicking 'Prikazano vozila' button to load listings...")
+                        button.click()
+                        page.wait_for_timeout(5000)
+                    else:
+                        logger.warning("Search button not found on page.")
+                except PlaywrightTimeout:
+                    logger.warning("Search button did not appear in time.")
+                
+                # Wait for JavaScript to render
+                logger.info("Waiting for dynamic content to load...")
+                page.wait_for_timeout(7000)
                 
                 # Wait for JavaScript to render
                 logger.info("Waiting for dynamic content to load...")
