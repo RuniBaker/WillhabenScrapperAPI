@@ -162,6 +162,12 @@ class WillhabenScraper:
                 except PlaywrightTimeout:
                     logger.warning("Result list container did not appear in time")
 
+                # Dump the rendered HTML for inspection
+                html = page.content()
+                with open("/tmp/debug.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                logger.info("Dumped page HTML to /tmp/debug.html")
+
                 # Now query for listings
                 listing_elements = page.query_selector_all('[data-testid="result-list"] article')
                 logger.info(f"Found {len(listing_elements)} listing <article> elements")
