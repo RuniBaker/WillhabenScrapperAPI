@@ -186,31 +186,39 @@ class WillhabenScraper:
                         href = link.get_attribute('href')
                         if not href:
                             continue
-                        
-                        # Car listings have pattern: /iad/.../auto/.../NUMERIC_ID
-                        # Example: /iad/kaufen-und-verkaufen/auto/seat-ibiza-1-4-16v-reference/535416196
-                        parts = href.split('/')
-                        
-                        # Check if it's an auto listing with numeric ID
-                        if len(parts) >= 3 and 'auto' in href:
-                            # Last part should be numeric ID
-                            potential_id = parts[-1].split('?')[0]  # Remove query params
+
+                        # Ensure full URL
+                        if not href.startswith('http'):
+                            href = f"https://www.willhaben.at{href}"
+
+                        # Match only car-related pages
+                        if '/auto/' not in href:
+                            continue
+
+                        import re
+                        listing_id = None
+
+                        # Case 1: numeric ID at the end of the path
+                        m = re.search(r'/(\d+)(?:\?|$)', href)
+                        if m:
+                            listing_id = m.group(1)
+                        else:
+                            # Case 2: numeric ID inside query parameters (?insertId=xxxx or ?adId=xxxx)
+                            m2 = re.search(r'(?:insertId|adId|entryId)=(\d+)', href)
+                            if m2:
+                                listing_id = m2.group(1)
+
+                        if not listing_id:
+                            continue
+
+                        if listing_id not in seen_ids:
+                            seen_ids.add(listing_id)
+                            car_listings.append({
+                                'link_element': link,
+                                'url': href,
+                                'listing_id': listing_id
+                            })
                             
-                            if potential_id.isdigit() and potential_id not in seen_ids:
-                                listing_id = potential_id
-                                seen_ids.add(listing_id)
-                                
-                                # Build full URL
-                                if not href.startswith('http'):
-                                    full_url = f"https://www.willhaben.at{href}"
-                                else:
-                                    full_url = href
-                                
-                                car_listings.append({
-                                    'link_element': link,
-                                    'url': full_url,
-                                    'listing_id': listing_id
-                                })
                     except Exception as e:
                         logger.debug(f"Error processing link: {str(e)}")
                         continue
