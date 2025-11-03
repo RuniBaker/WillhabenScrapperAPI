@@ -67,6 +67,8 @@ class Car(db.Model):
     image_urls = db.Column(db.JSON)  # Store array of image URLs
     url = db.Column(db.Text, nullable=False)
     description = db.Column(db.Text)
+    posted_at = db.Column(db.DateTime)  # When the car was posted on Willhaben
+    posted_at = db.Column(db.DateTime)  # When the car was originally posted on Willhaben
     first_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True, index=True)
@@ -91,6 +93,7 @@ class Car(db.Model):
             'image_urls': self.image_urls,  # Returns array like ["url1", "url2", ...]
             'url': self.url,
             'description': self.description,
+            'posted_at': self.posted_at.isoformat() if self.posted_at else None,
             'first_seen_at': self.first_seen_at.isoformat() if self.first_seen_at else None,
             'last_seen_at': self.last_seen_at.isoformat() if self.last_seen_at else None,
             'is_active': self.is_active,
@@ -309,6 +312,7 @@ class WillhabenScraper:
                         year = self._extract_year(text_content)
                         mileage = self._extract_mileage(text_content)
                         location = self._extract_location(text_content)
+                        posted_at = self._extract_posted_date(text_content)
                         brand, model = self._parse_brand_model(title)
 
                         car_data = {
@@ -326,6 +330,7 @@ class WillhabenScraper:
                             'image_urls': image_urls,  # Array instead of single URL
                             'url': url,
                             'description': text_content[:500] if text_content else title,
+                            'posted_at': posted_at,  # When car was posted on Willhaben
                         }
                         
                         cars.append(car_data)
@@ -386,6 +391,91 @@ class WillhabenScraper:
         match = re.search(r'\b(\d{4}\s+[A-ZÄÖÜa-zäöüß\s-]+?)(?:\n|$)', text)
         if match:
             return match.group(1).strip()[:200]
+        return None
+    
+    def _extract_posted_date(self, text: str) -> Optional[datetime]:
+        """Extract posting date/time from text"""
+        try:
+            # Look for relative time patterns (e.g., "vor 5 Minuten", "vor 2 Stunden", "Heute", "Gestern")
+            if 'vor' in text.lower():
+                # "vor X Minuten"
+                match = re.search(r'vor\s+(\d+)\s+minute[n]?', text, re.IGNORECASE)
+                if match:
+                    minutes = int(match.group(1))
+                    return datetime.utcnow() - timedelta(minutes=minutes)
+                
+                # "vor X Stunden"
+                match = re.search(r'vor\s+(\d+)\s+stunde[n]?', text, re.IGNORECASE)
+                if match:
+                    hours = int(match.group(1))
+                    return datetime.utcnow() - timedelta(hours=hours)
+                
+                # "vor X Tagen"
+                match = re.search(r'vor\s+(\d+)\s+tag[en]*', text, re.IGNORECASE)
+                if match:
+                    days = int(match.group(1))
+                    return datetime.utcnow() - timedelta(days=days)
+            
+            # "Heute" means today
+            if 'heute' in text.lower():
+                return datetime.utcnow()
+            
+            # "Gestern" means yesterday
+            if 'gestern' in text.lower():
+                return datetime.utcnow() - timedelta(days=1)
+            
+            # Look for specific date patterns (e.g., "03.11.2025")
+            match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', text)
+            if match:
+                day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                return datetime(year, month, day)
+                
+        except Exception as e:
+            logger.debug(f"Error parsing posted date: {e}")
+        
+        return None
+    
+    def _extract_posted_time(self, text: str) -> Optional[datetime]:
+        """Extract when the listing was posted"""
+        now = datetime.utcnow()
+        
+        # Check for relative time (e.g., "vor 2 Stunden", "vor 30 Minuten", "Heute", "Gestern")
+        if 'vor' in text.lower():
+            # "vor X Minuten"
+            match = re.search(r'vor\s+(\d+)\s*min', text, re.IGNORECASE)
+            if match:
+                minutes = int(match.group(1))
+                return now - timedelta(minutes=minutes)
+            
+            # "vor X Stunden"
+            match = re.search(r'vor\s+(\d+)\s*stunde', text, re.IGNORECASE)
+            if match:
+                hours = int(match.group(1))
+                return now - timedelta(hours=hours)
+            
+            # "vor X Tagen"
+            match = re.search(r'vor\s+(\d+)\s*tag', text, re.IGNORECASE)
+            if match:
+                days = int(match.group(1))
+                return now - timedelta(days=days)
+        
+        # Check for "Heute" (Today)
+        if 'heute' in text.lower():
+            return now
+        
+        # Check for "Gestern" (Yesterday)
+        if 'gestern' in text.lower():
+            return now - timedelta(days=1)
+        
+        # Try to find specific date format (e.g., "20.10.2024")
+        match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', text)
+        if match:
+            try:
+                day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                return datetime(year, month, day)
+            except:
+                pass
+        
         return None
     
     def _parse_brand_model(self, title: str) -> tuple:
@@ -496,8 +586,8 @@ def scrape_and_store_cars():
         try:
             logger.info("Starting background scraping job...")
             
-            # Optimize for maximum cars and speed
-            scraper = WillhabenScraper(max_cars=200, full_image_scraping=False)
+            # Optimize for maximum cars and speed - no limit
+            scraper = WillhabenScraper(max_cars=9999, full_image_scraping=False)
             scraped_cars = scraper.scrape_listings()
             
             log_entry.cars_found = len(scraped_cars)
@@ -516,12 +606,16 @@ def scrape_and_store_cars():
                     existing_car.is_active = True
                     existing_car.price = car_data.get('price')
                     existing_car.updated_at = datetime.utcnow()
+                    # Update posted_at if we have new data
+                    if car_data.get('posted_at'):
+                        existing_car.posted_at = car_data.get('posted_at')
                     cars_updated += 1
                 else:
                     # Add new car
                     new_car = Car(**car_data)
                     db.session.add(new_car)
                     cars_added += 1
+                    logger.info(f"🆕 NEW CAR: {car_data.get('title', 'Unknown')} - Posted: {car_data.get('posted_at', 'Unknown')}")
             
             # Mark cars as inactive if not seen in this scrape
             if current_listing_ids and len(scraped_cars) > 10:  # Safeguard: Only deactivate if >10 cars scraped
@@ -606,8 +700,12 @@ def get_cars():
         limit = request.args.get('limit', 20, type=int)
         limit = min(limit, 100)
         
-        # Sort by last_seen_at to show most recently updated cars first
-        query = Car.query.filter_by(is_active=True).order_by(Car.last_seen_at.desc(), Car.first_seen_at.desc())
+        # Sort by posted_at (when car was uploaded to Willhaben), then last_seen_at
+        query = Car.query.filter_by(is_active=True).order_by(
+            Car.posted_at.desc().nulls_last(), 
+            Car.last_seen_at.desc(), 
+            Car.first_seen_at.desc()
+        )
         pagination = query.paginate(page=page, per_page=limit, error_out=False)
         
         return jsonify({
@@ -699,8 +797,9 @@ def search_cars():
 def get_latest_car():
     """Get the single most recent car uploaded"""
     try:
-        # Get the most recently seen car
+        # Get the most recently posted car (by Willhaben upload time)
         latest_car = Car.query.filter_by(is_active=True).order_by(
+            Car.posted_at.desc().nulls_last(),
             Car.last_seen_at.desc(), 
             Car.first_seen_at.desc()
         ).first()
@@ -725,13 +824,17 @@ def get_recent_cars():
         limit = request.args.get('limit', 20, type=int)
         limit = min(limit, 100)
         
-        # Sort by last_seen_at to show the most freshly scraped cars
+        # Sort by posted_at to show the most recently uploaded cars on Willhaben
         cars = Car.query.filter(
             and_(
                 Car.is_active == True,
                 Car.first_seen_at >= cutoff_time
             )
-        ).order_by(Car.last_seen_at.desc(), Car.first_seen_at.desc()).limit(limit).all()
+        ).order_by(
+            Car.posted_at.desc().nulls_last(),
+            Car.last_seen_at.desc(), 
+            Car.first_seen_at.desc()
+        ).limit(limit).all()
         
         return jsonify({
             'cars': [car.to_dict() for car in cars],
