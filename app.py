@@ -185,7 +185,7 @@ class WillhabenScraper:
                             continue
 
                         # Extract numeric listing ID — covers both old and new formats
-                        match = re.search(r'/(\d+)(?:\?|$)', href)
+                        match = re.search(r'[-/](\d{6,})(?:\?|$)', href)
                         if not match:
                             continue
 
