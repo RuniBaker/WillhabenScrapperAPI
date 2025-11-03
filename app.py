@@ -911,3 +911,12 @@ if __name__ == '__main__':
     init_app()
     scheduler = init_scheduler()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
+
+@app.route("/api/debug-html", methods=["GET"])
+def debug_html():
+    """Return the dumped Playwright HTML for debugging"""
+    import pathlib
+    path = pathlib.Path("/tmp/debug.html")
+    if path.exists():
+        return app.response_class(path.read_text("utf-8"), mimetype="text/html")
+    return jsonify({"error": "No debug file found"}), 404
