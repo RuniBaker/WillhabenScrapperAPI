@@ -170,11 +170,11 @@ class WillhabenScraper:
                     logger.info(f"No cookie dialog or already accepted: {e}")
 
                 # Wait for page to fully load
-                page.wait_for_timeout(5000)
+                page.wait_for_timeout(10000)  # Wait 10 seconds for JS to load images
                 
                 # Scroll to trigger lazy loading
                 logger.info("Scrolling to load content...")
-                for i in range(3):
+                for i in range(5):  # Scroll more to trigger more lazy-loaded images
                     page.evaluate("window.scrollBy(0, window.innerHeight)")
                     page.wait_for_timeout(2000)
 
@@ -286,17 +286,90 @@ class WillhabenScraper:
                         if not title or len(title) < 3:
                             title = f"Car Listing {listing_id}"
                         
-                        # Extract image
+                        # Extract image - IMPROVED VERSION
                         image_url = None
                         try:
-                            img = link_element.query_selector('img')
+                            img = None
+                            
+                            # Try to find img element using multiple methods
+                            if not img:
+                                # Method 1: Direct query in link
+                                img = link_element.query_selector('img')
+                            
                             if not img and parent:
+                                # Method 2: Query in parent container
                                 img = parent.query_selector('img')
+                            
+                            if not img:
+                                # Method 3: Use JavaScript to search more broadly
+                                try:
+                                    img_handle = link_element.evaluate_handle('''el => {
+                                        // Look for img in various containers
+                                        let container = el.closest('article') || 
+                                                       el.closest('[class*="Card"]') || 
+                                                       el.closest('[data-testid*="result"]') ||
+                                                       el.parentElement?.parentElement?.parentElement;
+                                        
+                                        if (container) {
+                                            // Try to find img
+                                            let img = container.querySelector('img');
+                                            if (img) return img;
+                                            
+                                            // Try to find picture > img
+                                            let picture = container.querySelector('picture');
+                                            if (picture) {
+                                                img = picture.querySelector('img');
+                                                if (img) return img;
+                                            }
+                                        }
+                                        return null;
+                                    }''')
+                                    img = img_handle.as_element() if img_handle else None
+                                except Exception as je:
+                                    logger.debug(f"JS image search failed: {je}")
+                            
+                            # Extract image URL from element
                             if img:
-                                image_url = (img.get_attribute('src') or 
-                                           img.get_attribute('data-src') or
-                                           img.get_attribute('srcset', '').split()[0] if img.get_attribute('srcset') else None)
-                        except:
+                                # Try multiple attributes
+                                image_url = (
+                                    img.get_attribute('src') or 
+                                    img.get_attribute('data-src') or 
+                                    img.get_attribute('data-lazy-src') or
+                                    img.get_attribute('data-original') or
+                                    img.get_attribute('data-lazy')
+                                )
+                                
+                                # Try srcset if nothing found
+                                if not image_url:
+                                    srcset = img.get_attribute('srcset')
+                                    if srcset:
+                                        # Get first URL from srcset
+                                        parts = srcset.split(',')
+                                        if parts:
+                                            first_url = parts[0].strip().split()[0]
+                                            image_url = first_url
+                                
+                                # Fix relative URLs
+                                if image_url:
+                                    if image_url.startswith('//'):
+                                        image_url = f"https:{image_url}"
+                                    elif image_url.startswith('/') and not image_url.startswith('//'):
+                                        image_url = f"https://www.willhaben.at{image_url}"
+                                    elif not image_url.startswith('http'):
+                                        image_url = f"https://www.willhaben.at/{image_url}"
+                                    
+                                    # Skip placeholder images
+                                    lower_url = image_url.lower()
+                                    if 'placeholder' in lower_url or 'icon' in lower_url or image_url.endswith('.svg'):
+                                        image_url = None
+                                    else:
+                                        logger.debug(f"Found image for {listing_id}: {image_url[:80]}...")
+                            
+                            if not image_url:
+                                logger.warning(f"No image found for listing {listing_id}")
+                                        
+                        except Exception as e:
+                            logger.warning(f"Image extraction error for {listing_id}: {str(e)}")
                             pass
                         
                         # Parse data from text
