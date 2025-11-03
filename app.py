@@ -160,40 +160,35 @@ class WillhabenScraper:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(2000)
                 
-                # Get all links containing /iad/
                 logger.info("Extracting car listing links...")
-                all_links = page.query_selector_all('a[href*="/iad/"]')
-                logger.info(f"Found {len(all_links)} total /iad/ links")
 
-                # DEBUG: Show a few sample hrefs to understand why none match
-                sample_hrefs = []
-                for link in all_links[:10]:
-                    href = link.get_attribute('href')
-                    if href:
-                        sample_hrefs.append(href)
-                logger.info(f"Sample hrefs: {sample_hrefs}")
-                
-                import re
+                # Find listing containers
+                listing_elements = page.query_selector_all('[data-testid="search-result-entry"], article')
+
+                logger.info(f"Found {len(listing_elements)} potential listing containers")
 
                 car_listings = []
                 seen_ids = set()
+                import re
 
-                for link in all_links:
+                for item in listing_elements:
                     try:
+                        link = item.query_selector('a[href*="/iad/gebrauchtwagen/"]')
+                        if not link:
+                            continue
+
                         href = link.get_attribute('href')
                         if not href:
                             continue
 
-                        # Normalize to full URL
                         if not href.startswith('http'):
                             href = f"https://www.willhaben.at{href}"
 
-                        # Match only car detail pages (including new /d/auto/ structure)
-                        if not re.search(r'/auto/', href):
-                            continue
-
-                        # Extract numeric listing ID — covers both old and new formats
+                        # Extract numeric ID
                         match = re.search(r'[-/](\d{6,})(?:\?|$)', href)
+                        if not match:
+                            # Try fallback for redirect or query parameter formats
+                            match = re.search(r'(?:adId|insertId|entryId)=(\d+)', href)
                         if not match:
                             continue
 
@@ -207,7 +202,7 @@ class WillhabenScraper:
                                 'listing_id': listing_id
                             })
                     except Exception as e:
-                        logger.debug(f"Error processing link: {str(e)}")
+                        logger.debug(f"Error processing listing: {str(e)}")
                         continue
 
                 logger.info(f"Found {len(car_listings)} unique car listings")
