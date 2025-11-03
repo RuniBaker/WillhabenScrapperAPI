@@ -577,16 +577,16 @@ class WillhabenScraper:
 # ============================================================================
 
 def scrape_and_store_cars():
-    """Background job to scrape cars and store in database"""
+    """Fast scraping job - thumbnails only for speed"""
     with app.app_context():
         log_entry = ScrapingLog()
         db.session.add(log_entry)
         db.session.commit()
         
         try:
-            logger.info("Starting background scraping job...")
+            logger.info("Starting FAST scraping job (thumbnails only)...")
             
-            # Optimize for maximum cars and speed - no limit
+            # Fast scraping - thumbnails only, maximum cars
             scraper = WillhabenScraper(max_cars=9999, full_image_scraping=False)
             scraped_cars = scraper.scrape_listings()
             
@@ -645,6 +645,74 @@ def scrape_and_store_cars():
             log_entry.error_message = str(e)
             log_entry.scrape_completed_at = datetime.utcnow()
             db.session.commit()
+
+
+def enrich_cars_with_images():
+    """Background job to enrich cars with full image galleries"""
+    with app.app_context():
+        try:
+            logger.info("Starting image enrichment job...")
+            
+            # Find cars that only have 1 or 0 images (thumbnails only)
+            cars_needing_images = Car.query.filter(
+                and_(
+                    Car.is_active == True,
+                    or_(
+                        Car.image_urls == None,
+                        func.jsonb_array_length(Car.image_urls) <= 1
+                    )
+                )
+            ).order_by(Car.first_seen_at.desc()).limit(20).all()  # Process 20 cars per run
+            
+            if not cars_needing_images:
+                logger.info("No cars need image enrichment")
+                return
+            
+            logger.info(f"Found {len(cars_needing_images)} cars needing full images")
+            
+            # Use Playwright to visit detail pages
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                )
+                context = browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    locale='de-AT'
+                )
+                page = context.new_page()
+                
+                scraper = WillhabenScraper(max_cars=1, full_image_scraping=False)
+                enriched_count = 0
+                
+                for car in cars_needing_images:
+                    try:
+                        logger.info(f"Enriching images for: {car.title[:50]}...")
+                        
+                        # Get full images from detail page
+                        full_images = scraper.scrape_car_images(page, car.url)
+                        
+                        if full_images and len(full_images) > 1:
+                            car.image_urls = full_images
+                            car.updated_at = datetime.utcnow()
+                            enriched_count += 1
+                            logger.info(f"✓ Added {len(full_images)} images to {car.listing_id}")
+                        else:
+                            logger.debug(f"No additional images found for {car.listing_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error enriching car {car.listing_id}: {str(e)}")
+                        continue
+                
+                browser.close()
+            
+            db.session.commit()
+            logger.info(f"Image enrichment completed: {enriched_count}/{len(cars_needing_images)} cars enriched")
+            
+        except Exception as e:
+            logger.error(f"Image enrichment job failed: {str(e)}")
+            db.session.rollback()
 
 
 def cleanup_inactive_cars():
@@ -887,14 +955,25 @@ def init_scheduler():
     """Initialize APScheduler with background jobs"""
     scheduler = BackgroundScheduler(timezone='UTC')
     
+    # STAGE 1: Fast scraping - thumbnails only (every 5 seconds)
     scheduler.add_job(
         func=scrape_and_store_cars,
-        trigger=IntervalTrigger(seconds=5),  # Scrape every 5 seconds for maximum freshness
-        id='scrape_job',
-        name='Scrape cars every 5 seconds',
+        trigger=IntervalTrigger(seconds=5),
+        id='fast_scrape_job',
+        name='Fast scrape (thumbnails) every 5 seconds',
         replace_existing=True
     )
     
+    # STAGE 2: Image enrichment - full galleries (every 2 minutes)
+    scheduler.add_job(
+        func=enrich_cars_with_images,
+        trigger=IntervalTrigger(minutes=2),
+        id='image_enrichment_job',
+        name='Enrich cars with full images every 2 minutes',
+        replace_existing=True
+    )
+    
+    # STAGE 3: Daily cleanup
     scheduler.add_job(
         func=cleanup_inactive_cars,
         trigger=CronTrigger(hour=23, minute=0),
