@@ -177,39 +177,31 @@ class WillhabenScraper:
                 all_links = page.query_selector_all('a[href*="/iad/"]')
                 logger.info(f"Found {len(all_links)} total /iad/ links")
                 
-                # Extract unique car listings
+                import re
+
                 car_listings = []
                 seen_ids = set()
-                
+
                 for link in all_links:
                     try:
                         href = link.get_attribute('href')
                         if not href:
                             continue
 
-                        # Ensure full URL
+                        # Normalize to full URL
                         if not href.startswith('http'):
                             href = f"https://www.willhaben.at{href}"
 
-                        # Match only car-related pages
-                        if '/auto/' not in href:
+                        # Match only car detail pages (including new /d/auto/ structure)
+                        if not re.search(r'/auto/', href):
                             continue
 
-                        import re
-                        listing_id = None
-
-                        # Case 1: numeric ID at the end of the path
-                        m = re.search(r'/(\d+)(?:\?|$)', href)
-                        if m:
-                            listing_id = m.group(1)
-                        else:
-                            # Case 2: numeric ID inside query parameters (?insertId=xxxx or ?adId=xxxx)
-                            m2 = re.search(r'(?:insertId|adId|entryId)=(\d+)', href)
-                            if m2:
-                                listing_id = m2.group(1)
-
-                        if not listing_id:
+                        # Extract numeric listing ID — covers both old and new formats
+                        match = re.search(r'/(\d+)(?:\?|$)', href)
+                        if not match:
                             continue
+
+                        listing_id = match.group(1)
 
                         if listing_id not in seen_ids:
                             seen_ids.add(listing_id)
@@ -218,10 +210,13 @@ class WillhabenScraper:
                                 'url': href,
                                 'listing_id': listing_id
                             })
-                            
                     except Exception as e:
                         logger.debug(f"Error processing link: {str(e)}")
                         continue
+
+                logger.info(f"Found {len(car_listings)} unique car listings")
+                if car_listings:
+                    logger.info(f"Example listing: {car_listings[0]['url']}")
                 
                 logger.info(f"Found {len(car_listings)} unique car listings")
                 
