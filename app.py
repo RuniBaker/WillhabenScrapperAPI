@@ -664,6 +664,7 @@ def scrape_and_store_cars():
             log_entry.cars_found = len(scraped_cars)
             cars_added = 0
             cars_updated = 0
+            newly_added_listing_ids: List[str] = []
             
             # Get all current listing IDs to mark inactive
             current_listing_ids = {car['listing_id'] for car in scraped_cars}
@@ -689,6 +690,7 @@ def scrape_and_store_cars():
                     db.session.add(new_car)
                     cars_added += 1
                     logger.info(f"🆕 NEW CAR: {car_data.get('title', 'Unknown')} - Posted: {car_data.get('posted_at', 'Unknown')}")
+                    newly_added_listing_ids.append(car_data['listing_id'])
             
             # Mark cars as inactive if not seen in this scrape
             if current_listing_ids and len(scraped_cars) > 10:  # Safeguard: Only deactivate if >10 cars scraped
@@ -711,6 +713,12 @@ def scrape_and_store_cars():
             db.session.commit()
             
             logger.info(f"Scraping completed: {cars_added} added, {cars_updated} updated, {len(scraped_cars)} total")
+
+            if newly_added_listing_ids:
+                try:
+                    priority_enrich_latest(newly_added_listing_ids)
+                except Exception as enrich_err:
+                    logger.error(f"Priority enrichment failed: {enrich_err}")
             
         except Exception as e:
             logger.error(f"Scraping job failed: {str(e)}")
@@ -796,6 +804,63 @@ def enrich_cars_with_images():
         except Exception as e:
             logger.error(f"Image enrichment job failed: {str(e)}")
             db.session.rollback()
+
+
+def priority_enrich_latest(listing_ids: List[str], max_items: int = 10):
+    """Immediately enrich brand-new listings so latest cars appear complete"""
+    if not listing_ids:
+        return
+
+    limited_ids = list(dict.fromkeys(listing_ids))[:max_items]
+    logger.info(f"Priority enriching latest listings: {limited_ids}")
+
+    cars = Car.query.filter(Car.listing_id.in_(limited_ids)).all()
+    if not cars:
+        return
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            )
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                locale='de-AT'
+            )
+            page = context.new_page()
+            scraper = WillhabenScraper(max_cars=1, full_image_scraping=False)
+
+            enriched = 0
+            for car in cars:
+                try:
+                    details = scraper.scrape_car_details(page, car.url)
+                    images = details.get('images') or []
+                    posted_at = details.get('posted_at')
+
+                    if images and (not car.image_urls or len(car.image_urls) <= 1):
+                        car.image_urls = images
+                        logger.info(f"Priority: updated images for {car.listing_id}")
+
+                    if posted_at and (car.posted_at is None or car.posted_at != posted_at):
+                        car.posted_at = posted_at
+                        logger.info(f"Priority: updated posted_at for {car.listing_id} -> {posted_at}")
+
+                    car.updated_at = datetime.utcnow()
+                    enriched += 1
+                except Exception as detail_err:
+                    logger.error(f"Priority enrichment failed for {car.listing_id}: {detail_err}")
+                    continue
+
+            browser.close()
+
+        db.session.commit()
+        logger.info(f"Priority enrichment complete: {enriched}/{len(cars)} listings updated")
+
+    except Exception as exc:
+        logger.error(f"Priority enrichment error: {exc}")
+        db.session.rollback()
 
 
 def cleanup_inactive_cars():
