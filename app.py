@@ -48,7 +48,7 @@ CET = pytz.timezone('Europe/Vienna')
 # Fast scrape configuration
 FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '150'))
 FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '10'))
-POSTED_AT_OFFSET_HOURS = int(os.getenv('POSTED_AT_OFFSET_HOURS', '1'))
+POSTED_AT_OFFSET_HOURS = int(os.getenv('POSTED_AT_OFFSET_HOURS', '2'))
 POSTED_AT_OFFSET = timedelta(hours=POSTED_AT_OFFSET_HOURS)
 
 # ============================================================================
@@ -483,7 +483,7 @@ class WillhabenScraper:
                 time_part = match.group(2) or '00:00'
                 dt_local = datetime.strptime(f"{date_part} {time_part}", "%d.%m.%Y %H:%M")
                 dt_utc = CET.localize(dt_local).astimezone(pytz.UTC).replace(tzinfo=None)
-                return dt_utc
+                return dt_utc + POSTED_AT_OFFSET
 
             lowered = cleaned.lower()
 
@@ -491,21 +491,21 @@ class WillhabenScraper:
             if 'vor' in lowered:
                 rel_match = re.search(r'vor\s+(\d+)\s+minute[n]?', lowered)
                 if rel_match:
-                    return datetime.utcnow() - timedelta(minutes=int(rel_match.group(1)))
+                    return datetime.utcnow() - timedelta(minutes=int(rel_match.group(1))) + POSTED_AT_OFFSET
 
                 rel_match = re.search(r'vor\s+(\d+)\s+stunde[n]?', lowered)
                 if rel_match:
-                    return datetime.utcnow() - timedelta(hours=int(rel_match.group(1)))
+                    return datetime.utcnow() - timedelta(hours=int(rel_match.group(1))) + POSTED_AT_OFFSET
 
                 rel_match = re.search(r'vor\s+(\d+)\s+tag[en]?', lowered)
                 if rel_match:
-                    return datetime.utcnow() - timedelta(days=int(rel_match.group(1)))
+                    return datetime.utcnow() - timedelta(days=int(rel_match.group(1))) + POSTED_AT_OFFSET
 
             if 'heute' in lowered:
-                return datetime.utcnow()
+                return datetime.utcnow() + POSTED_AT_OFFSET
 
             if 'gestern' in lowered:
-                return datetime.utcnow() - timedelta(days=1)
+                return datetime.utcnow() - timedelta(days=1) + POSTED_AT_OFFSET
 
             # Standalone date and optional time
             match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})(?:,\s*(\d{1,2}:\d{2}))?', cleaned)
@@ -514,7 +514,7 @@ class WillhabenScraper:
                 time_part = match.group(4) or '00:00'
                 dt_local = datetime.strptime(f"{day:02d}.{month:02d}.{year:04d} {time_part}", "%d.%m.%Y %H:%M")
                 dt_utc = CET.localize(dt_local).astimezone(pytz.UTC).replace(tzinfo=None)
-                return dt_utc
+                return dt_utc + POSTED_AT_OFFSET
 
         except Exception as e:
             logger.debug(f"Error parsing posted date: {e}")
