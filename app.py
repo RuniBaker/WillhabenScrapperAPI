@@ -45,6 +45,10 @@ db = SQLAlchemy(app)
 # Timezone for CET
 CET = pytz.timezone('Europe/Vienna')
 
+# Fast scrape configuration
+FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '150'))
+FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '10'))
+
 # ============================================================================
 # DATABASE MODELS
 # ============================================================================
@@ -67,7 +71,6 @@ class Car(db.Model):
     image_urls = db.Column(db.JSON)  # Store array of image URLs
     url = db.Column(db.Text, nullable=False)
     description = db.Column(db.Text)
-    posted_at = db.Column(db.DateTime)  # When the car was posted on Willhaben
     posted_at = db.Column(db.DateTime)  # When the car was originally posted on Willhaben
     first_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -290,20 +293,93 @@ class WillhabenScraper:
                         if not title or len(title) < 3:
                             title = f"Car Listing {listing_id}"
                         
-                        # Extract thumbnail only for speed
+                        # Extract thumbnail quickly but handle lazy-loading variations
                         image_url = None
                         try:
-                            img = link_element.query_selector('img')
+                            img = None
+
+                            if not img:
+                                img = link_element.query_selector('img')
+
                             if not img and parent:
                                 img = parent.query_selector('img')
+
+                            if not img:
+                                # Broader search via JavaScript for nested galleries/picture tags
+                                try:
+                                    img_handle = link_element.evaluate_handle('''el => {
+                                        let container = el.closest('article') ||
+                                                        el.closest('[class*="Card"]') ||
+                                                        el.closest('[data-testid*="result"]') ||
+                                                        el.parentElement?.parentElement;
+                                        if (!container) return null;
+
+                                        let img = container.querySelector('img');
+                                        if (img) return img;
+
+                                        let picture = container.querySelector('picture');
+                                        if (picture) {
+                                            img = picture.querySelector('img');
+                                            if (img) return img;
+                                        }
+
+                                        return null;
+                                    }''')
+                                    img = img_handle.as_element() if img_handle else None
+                                except Exception as je:
+                                    logger.debug(f"JS thumbnail lookup failed: {je}")
+
                             if img:
-                                image_url = (img.get_attribute('src') or 
-                                           img.get_attribute('data-src') or
-                                           img.get_attribute('data-lazy-src') or
-                                           img.get_attribute('srcset', '').split()[0] if img.get_attribute('srcset') else None)
-                        except:
-                            pass
-                        
+                                image_url = (
+                                    img.get_attribute('src') or
+                                    img.get_attribute('data-src') or
+                                    img.get_attribute('data-lazy-src') or
+                                    img.get_attribute('data-original') or
+                                    img.get_attribute('data-lazy')
+                                )
+
+                                if not image_url:
+                                    srcset = img.get_attribute('srcset')
+                                    if srcset:
+                                        parts = [segment.strip().split()[0] for segment in srcset.split(',') if segment.strip()]
+                                        if parts:
+                                            image_url = parts[0]
+
+                                if image_url:
+                                    if image_url.startswith('//'):
+                                        image_url = f"https:{image_url}"
+                                    elif image_url.startswith('/') and not image_url.startswith('//'):
+                                        image_url = f"https://www.willhaben.at{image_url}"
+                                    elif not image_url.startswith('http'):
+                                        image_url = f"https://www.willhaben.at/{image_url.lstrip('/')}"
+
+                                    lower_url = image_url.lower()
+                                    if 'placeholder' in lower_url or 'icon' in lower_url or image_url.endswith('.svg'):
+                                        image_url = None
+
+                            if not image_url:
+                                # Fallback for background-image thumbnails
+                                try:
+                                    bg_image = link_element.evaluate("el => window.getComputedStyle(el).backgroundImage || ''")
+                                    if bg_image and 'url(' in bg_image:
+                                        bg_url = bg_image.split('url(')[-1].rstrip(')').strip('"\' ')
+                                        if bg_url:
+                                            if bg_url.startswith('//'):
+                                                bg_url = f"https:{bg_url}"
+                                            elif bg_url.startswith('/'):
+                                                bg_url = f"https://www.willhaben.at{bg_url}"
+                                            elif not bg_url.startswith('http'):
+                                                bg_url = f"https://www.willhaben.at/{bg_url.lstrip('/')}"
+
+                                            lower_bg = bg_url.lower()
+                                            if 'placeholder' not in lower_bg and 'icon' not in lower_bg and not bg_url.endswith('.svg'):
+                                                image_url = bg_url
+                                except Exception as be:
+                                    logger.debug(f"Background image lookup failed: {be}")
+
+                        except Exception as e_img:
+                            logger.debug(f"Thumbnail extraction error: {e_img}")
+
                         # Store as array for consistency
                         image_urls = [image_url] if image_url else []
 
@@ -396,86 +472,51 @@ class WillhabenScraper:
     def _extract_posted_date(self, text: str) -> Optional[datetime]:
         """Extract posting date/time from text"""
         try:
-            # Look for relative time patterns (e.g., "vor 5 Minuten", "vor 2 Stunden", "Heute", "Gestern")
-            if 'vor' in text.lower():
-                # "vor X Minuten"
-                match = re.search(r'vor\s+(\d+)\s+minute[n]?', text, re.IGNORECASE)
-                if match:
-                    minutes = int(match.group(1))
-                    return datetime.utcnow() - timedelta(minutes=minutes)
-                
-                # "vor X Stunden"
-                match = re.search(r'vor\s+(\d+)\s+stunde[n]?', text, re.IGNORECASE)
-                if match:
-                    hours = int(match.group(1))
-                    return datetime.utcnow() - timedelta(hours=hours)
-                
-                # "vor X Tagen"
-                match = re.search(r'vor\s+(\d+)\s+tag[en]*', text, re.IGNORECASE)
-                if match:
-                    days = int(match.group(1))
-                    return datetime.utcnow() - timedelta(days=days)
-            
-            # "Heute" means today
-            if 'heute' in text.lower():
+            cleaned = text.replace('\u00a0', ' ').replace(' Uhr', '')
+
+            # Explicit "Zuletzt geändert" or "Erstellt am" with date and optional time
+            match = re.search(r'(?:zuletzt\s+geändert|erstellt\s+am)\s*:?\s*(\d{1,2}\.\d{1,2}\.\d{4})(?:,\s*(\d{1,2}:\d{2}))?', cleaned, re.IGNORECASE)
+            if match:
+                date_part = match.group(1)
+                time_part = match.group(2) or '00:00'
+                dt_local = datetime.strptime(f"{date_part} {time_part}", "%d.%m.%Y %H:%M")
+                dt_utc = CET.localize(dt_local).astimezone(pytz.UTC).replace(tzinfo=None)
+                return dt_utc
+
+            lowered = cleaned.lower()
+
+            # Relative time patterns (e.g., "vor 5 Minuten", "vor 2 Stunden")
+            if 'vor' in lowered:
+                rel_match = re.search(r'vor\s+(\d+)\s+minute[n]?', lowered)
+                if rel_match:
+                    return datetime.utcnow() - timedelta(minutes=int(rel_match.group(1)))
+
+                rel_match = re.search(r'vor\s+(\d+)\s+stunde[n]?', lowered)
+                if rel_match:
+                    return datetime.utcnow() - timedelta(hours=int(rel_match.group(1)))
+
+                rel_match = re.search(r'vor\s+(\d+)\s+tag[en]?', lowered)
+                if rel_match:
+                    return datetime.utcnow() - timedelta(days=int(rel_match.group(1)))
+
+            if 'heute' in lowered:
                 return datetime.utcnow()
-            
-            # "Gestern" means yesterday
-            if 'gestern' in text.lower():
+
+            if 'gestern' in lowered:
                 return datetime.utcnow() - timedelta(days=1)
-            
-            # Look for specific date patterns (e.g., "03.11.2025")
-            match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', text)
+
+            # Standalone date and optional time
+            match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})(?:,\s*(\d{1,2}:\d{2}))?', cleaned)
             if match:
                 day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                return datetime(year, month, day)
-                
+                time_part = match.group(4) or '00:00'
+                dt_local = datetime.strptime(f"{day:02d}.{month:02d}.{year:04d} {time_part}", "%d.%m.%Y %H:%M")
+                dt_utc = CET.localize(dt_local).astimezone(pytz.UTC).replace(tzinfo=None)
+                return dt_utc
+
         except Exception as e:
             logger.debug(f"Error parsing posted date: {e}")
-        
-        return None
-    
-    def _extract_posted_time(self, text: str) -> Optional[datetime]:
-        """Extract when the listing was posted"""
-        now = datetime.utcnow()
-        
-        # Check for relative time (e.g., "vor 2 Stunden", "vor 30 Minuten", "Heute", "Gestern")
-        if 'vor' in text.lower():
-            # "vor X Minuten"
-            match = re.search(r'vor\s+(\d+)\s*min', text, re.IGNORECASE)
-            if match:
-                minutes = int(match.group(1))
-                return now - timedelta(minutes=minutes)
-            
-            # "vor X Stunden"
-            match = re.search(r'vor\s+(\d+)\s*stunde', text, re.IGNORECASE)
-            if match:
-                hours = int(match.group(1))
-                return now - timedelta(hours=hours)
-            
-            # "vor X Tagen"
-            match = re.search(r'vor\s+(\d+)\s*tag', text, re.IGNORECASE)
-            if match:
-                days = int(match.group(1))
-                return now - timedelta(days=days)
-        
-        # Check for "Heute" (Today)
-        if 'heute' in text.lower():
-            return now
-        
-        # Check for "Gestern" (Yesterday)
-        if 'gestern' in text.lower():
-            return now - timedelta(days=1)
-        
-        # Try to find specific date format (e.g., "20.10.2024")
-        match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', text)
-        if match:
-            try:
-                day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                return datetime(year, month, day)
-            except:
-                pass
-        
+
         return None
     
     def _parse_brand_model(self, title: str) -> tuple:
@@ -586,8 +627,8 @@ def scrape_and_store_cars():
         try:
             logger.info("Starting FAST scraping job (thumbnails only)...")
             
-            # Fast scraping - thumbnails only, maximum cars
-            scraper = WillhabenScraper(max_cars=9999, full_image_scraping=False)
+            # Fast scraping - thumbnails only, limited for speed
+            scraper = WillhabenScraper(max_cars=FAST_SCRAPE_MAX_CARS, full_image_scraping=False)
             scraped_cars = scraper.scrape_listings()
             
             log_entry.cars_found = len(scraped_cars)
@@ -609,6 +650,8 @@ def scrape_and_store_cars():
                     # Update posted_at if we have new data
                     if car_data.get('posted_at'):
                         existing_car.posted_at = car_data.get('posted_at')
+                    if car_data.get('image_urls'):
+                        existing_car.image_urls = car_data.get('image_urls')
                     cars_updated += 1
                 else:
                     # Add new car
@@ -653,16 +696,20 @@ def enrich_cars_with_images():
         try:
             logger.info("Starting image enrichment job...")
             
-            # Find cars that only have 1 or 0 images (thumbnails only)
-            cars_needing_images = Car.query.filter(
-                and_(
-                    Car.is_active == True,
-                    or_(
-                        Car.image_urls == None,
-                        func.jsonb_array_length(Car.image_urls) <= 1
-                    )
-                )
-            ).order_by(Car.first_seen_at.desc()).limit(20).all()  # Process 20 cars per run
+            # Find candidates and filter for cars that only have 1 or 0 images (thumbnails only)
+            candidate_cars = Car.query.filter(
+                Car.is_active == True
+            ).order_by(Car.first_seen_at.desc()).limit(200).all()
+
+            cars_needing_images = []
+            for car in candidate_cars:
+                urls = car.image_urls or []
+                if not isinstance(urls, list):
+                    continue
+                if len(urls) <= 1:
+                    cars_needing_images.append(car)
+                if len(cars_needing_images) >= 20:
+                    break
             
             if not cars_needing_images:
                 logger.info("No cars need image enrichment")
@@ -958,10 +1005,12 @@ def init_scheduler():
     # STAGE 1: Fast scraping - thumbnails only (every 5 seconds)
     scheduler.add_job(
         func=scrape_and_store_cars,
-        trigger=IntervalTrigger(seconds=5),
+        trigger=IntervalTrigger(seconds=FAST_SCRAPE_INTERVAL_SECONDS),
         id='fast_scrape_job',
-        name='Fast scrape (thumbnails) every 5 seconds',
-        replace_existing=True
+        name=f'Fast scrape (thumbnails) every {FAST_SCRAPE_INTERVAL_SECONDS} seconds',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True
     )
     
     # STAGE 2: Image enrichment - full galleries (every 2 minutes)
