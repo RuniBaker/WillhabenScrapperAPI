@@ -48,8 +48,6 @@ CET = pytz.timezone('Europe/Vienna')
 # Fast scrape configuration
 FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '150'))
 FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '10'))
-POSTED_AT_OFFSET_HOURS = int(os.getenv('POSTED_AT_OFFSET_HOURS', '0'))
-POSTED_AT_OFFSET = timedelta(hours=POSTED_AT_OFFSET_HOURS)
 
 # ============================================================================
 # DATABASE MODELS
@@ -463,58 +461,63 @@ class WillhabenScraper:
             except:
                 pass
         return None
-    
+
     def _extract_location(self, text: str) -> Optional[str]:
         """Extract location from text"""
         match = re.search(r'\b(\d{4}\s+[A-ZÄÖÜa-zäöüß\s-]+?)(?:\n|$)', text)
         if match:
             return match.group(1).strip()[:200]
         return None
-    
-    def _extract_posted_date(self, text: str) -> Optional[datetime]:
-        """Extract posting date/time from text"""
-        try:
-            cleaned = text.replace('\u00a0', ' ').replace(' Uhr', '')
 
-            # Explicit "Zuletzt geändert" or "Erstellt am" with date and optional time
-            match = re.search(r'(?:zuletzt\s+geändert|erstellt\s+am)\s*:?\s*(\d{1,2}\.\d{1,2}\.\d{4})(?:,\s*(\d{1,2}:\d{2}))?', cleaned, re.IGNORECASE)
-            if match:
-                date_part = match.group(1)
-                time_part = match.group(2) or '00:00'
+    def _extract_posted_date(self, text: str) -> Optional[datetime]:
+        """Extract posting date/time from text (stored in CET local time)"""
+        cleaned = text.replace('\u00a0', ' ').replace(' Uhr', '')
+        now_local = datetime.now(CET)
+
+        try:
+            explicit_pattern = re.search(
+                r'(?:zuletzt\s+geändert|erstellt\s+am)\s*:?'  # label
+                r'\s*(\d{1,2}\.\d{1,2}\.\d{4})'            # date
+                r'(?:,\s*(\d{1,2}:\d{2}))?',                 # optional time
+                cleaned,
+                re.IGNORECASE
+            )
+            if explicit_pattern:
+                date_part = explicit_pattern.group(1)
+                time_part = explicit_pattern.group(2) or '00:00'
                 dt_local = datetime.strptime(f"{date_part} {time_part}", "%d.%m.%Y %H:%M")
-                dt_utc = CET.localize(dt_local).astimezone(pytz.UTC).replace(tzinfo=None)
-                return dt_utc + POSTED_AT_OFFSET
+                return CET.localize(dt_local).replace(tzinfo=None)
 
             lowered = cleaned.lower()
 
-            # Relative time patterns (e.g., "vor 5 Minuten", "vor 2 Stunden")
             if 'vor' in lowered:
                 rel_match = re.search(r'vor\s+(\d+)\s+minute[n]?', lowered)
                 if rel_match:
-                    return datetime.utcnow() - timedelta(minutes=int(rel_match.group(1))) + POSTED_AT_OFFSET
+                    return (now_local - timedelta(minutes=int(rel_match.group(1)))).replace(tzinfo=None)
 
                 rel_match = re.search(r'vor\s+(\d+)\s+stunde[n]?', lowered)
                 if rel_match:
-                    return datetime.utcnow() - timedelta(hours=int(rel_match.group(1))) + POSTED_AT_OFFSET
+                    return (now_local - timedelta(hours=int(rel_match.group(1)))).replace(tzinfo=None)
 
                 rel_match = re.search(r'vor\s+(\d+)\s+tag[en]?', lowered)
                 if rel_match:
-                    return datetime.utcnow() - timedelta(days=int(rel_match.group(1))) + POSTED_AT_OFFSET
+                    return (now_local - timedelta(days=int(rel_match.group(1)))).replace(tzinfo=None)
 
             if 'heute' in lowered:
-                return datetime.utcnow() + POSTED_AT_OFFSET
+                return now_local.replace(tzinfo=None)
 
             if 'gestern' in lowered:
-                return datetime.utcnow() - timedelta(days=1) + POSTED_AT_OFFSET
+                return (now_local - timedelta(days=1)).replace(tzinfo=None)
 
-            # Standalone date and optional time
-            match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})(?:,\s*(\d{1,2}:\d{2}))?', cleaned)
-            if match:
-                day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                time_part = match.group(4) or '00:00'
+            fallback_pattern = re.search(
+                r'(\d{1,2})\.(\d{1,2})\.(\d{4})(?:,\s*(\d{1,2}:\d{2}))?',
+                cleaned
+            )
+            if fallback_pattern:
+                day, month, year = map(int, fallback_pattern.group(1, 2, 3))
+                time_part = fallback_pattern.group(4) or '00:00'
                 dt_local = datetime.strptime(f"{day:02d}.{month:02d}.{year:04d} {time_part}", "%d.%m.%Y %H:%M")
-                dt_utc = CET.localize(dt_local).astimezone(pytz.UTC).replace(tzinfo=None)
-                return dt_utc + POSTED_AT_OFFSET
+                return CET.localize(dt_local).replace(tzinfo=None)
 
         except Exception as e:
             logger.debug(f"Error parsing posted date: {e}")
