@@ -552,17 +552,20 @@ class WillhabenScraper:
         
         return None, None
     
-    def scrape_car_images(self, page, car_url: str) -> List[str]:
+    def scrape_car_details(self, page, car_url: str) -> Dict[str, Any]:
         """
-        Visit car detail page and extract all images from gallery
+        Visit car detail page and extract images and metadata
         """
-        images = []
-        
+        details: Dict[str, Any] = {
+            'images': [],
+            'posted_at': None,
+        }
+
         try:
-            logger.info(f"Fetching images from detail page: {car_url}")
+            logger.info(f"Fetching detail page: {car_url}")
             page.goto(car_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
-            
+
             # Try multiple selectors for image galleries
             image_selectors = [
                 'img[class*="gallery"]',
@@ -572,9 +575,9 @@ class WillhabenScraper:
                 'picture img',
                 '.image-gallery img'
             ]
-            
+
             seen_urls = set()
-            
+
             for selector in image_selectors:
                 img_elements = page.query_selector_all(selector)
                 for img in img_elements:
@@ -583,34 +586,61 @@ class WillhabenScraper:
                         img.get_attribute('data-src') or
                         img.get_attribute('data-original')
                     )
-                    
-                    # Handle srcset
+
+                    # Handle srcset for higher resolution
                     if not url:
                         srcset = img.get_attribute('srcset')
                         if srcset:
-                            # Get highest resolution image
-                            urls = [s.strip().split()[0] for s in srcset.split(',')]
+                            urls = [s.strip().split()[0] for s in srcset.split(',') if s.strip()]
                             if urls:
-                                url = urls[-1]  # Last one is usually highest res
-                    
+                                url = urls[-1]
+
                     if url and url not in seen_urls:
-                        # Fix relative URLs
                         if url.startswith('//'):
                             url = f"https:{url}"
                         elif url.startswith('/'):
                             url = f"https://www.willhaben.at{url}"
-                        
-                        # Skip thumbnails and icons
-                        if 'thumb' not in url.lower() and 'icon' not in url.lower() and not url.endswith('.svg'):
-                            images.append(url)
+
+                        lower_url = url.lower()
+                        if 'thumb' not in lower_url and 'icon' not in lower_url and not url.endswith('.svg'):
+                            details['images'].append(url)
                             seen_urls.add(url)
-            
-            logger.info(f"Found {len(images)} images for car")
-            return images[:10]  # Limit to 10 images max
-            
+
+            logger.info(f"Found {len(details['images'])} images for car")
+
+            # Collect metadata text for posted_at extraction
+            metadata_texts: List[str] = []
+            metadata_selectors = [
+                "text=/Zuletzt geändert/i",
+                "text=/Erstellt am/i",
+                '[data-testid*="metadata"]',
+                '[class*="Meta"]',
+                '[class*="Details"]'
+            ]
+
+            for selector in metadata_selectors:
+                try:
+                    nodes = page.query_selector_all(selector)
+                    for node in nodes:
+                        try:
+                            metadata_texts.append(node.inner_text())
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            if metadata_texts:
+                combined_text = "\n".join(metadata_texts)
+                extracted_date = self._extract_posted_date(combined_text)
+                if extracted_date:
+                    details['posted_at'] = extracted_date
+
         except Exception as e:
-            logger.error(f"Error scraping images from {car_url}: {str(e)}")
-            return []
+            logger.error(f"Error scraping details from {car_url}: {str(e)}")
+
+        # Limit image list to 10 for storage
+        details['images'] = details['images'][:10]
+        return details
 
 
 # ============================================================================
@@ -735,18 +765,24 @@ def enrich_cars_with_images():
                 
                 for car in cars_needing_images:
                     try:
-                        logger.info(f"Enriching images for: {car.title[:50]}...")
-                        
-                        # Get full images from detail page
-                        full_images = scraper.scrape_car_images(page, car.url)
-                        
-                        if full_images and len(full_images) > 1:
+                        logger.info(f"Enriching details for: {car.title[:50]}...")
+
+                        details = scraper.scrape_car_details(page, car.url)
+                        full_images = details.get('images', [])
+                        posted_at = details.get('posted_at')
+
+                        if full_images and len(full_images) > max(len(car.image_urls or []), 1):
                             car.image_urls = full_images
-                            car.updated_at = datetime.utcnow()
                             enriched_count += 1
                             logger.info(f"✓ Added {len(full_images)} images to {car.listing_id}")
                         else:
                             logger.debug(f"No additional images found for {car.listing_id}")
+
+                        if posted_at and car.posted_at != posted_at:
+                            car.posted_at = posted_at
+                            logger.info(f"✓ Updated posted_at for {car.listing_id} -> {posted_at}")
+
+                        car.updated_at = datetime.utcnow()
                         
                     except Exception as e:
                         logger.error(f"Error enriching car {car.listing_id}: {str(e)}")
