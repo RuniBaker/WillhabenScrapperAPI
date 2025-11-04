@@ -48,6 +48,8 @@ CET = pytz.timezone('Europe/Vienna')
 # Fast scrape configuration
 FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '150'))
 FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '10'))
+POSTED_AT_OFFSET_HOURS = int(os.getenv('POSTED_AT_OFFSET_HOURS', '1'))
+POSTED_AT_OFFSET = timedelta(hours=POSTED_AT_OFFSET_HOURS)
 
 # ============================================================================
 # DATABASE MODELS
