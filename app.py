@@ -48,6 +48,8 @@ CET = pytz.timezone('Europe/Vienna')
 # Fast scrape configuration
 FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '150'))
 FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '10'))
+POSTED_AT_HARD_OFFSET_HOURS = int(os.getenv('POSTED_AT_HARD_OFFSET_HOURS', '1'))
+POSTED_AT_HARD_OFFSET = timedelta(hours=POSTED_AT_HARD_OFFSET_HOURS)
 
 # ============================================================================
 # DATABASE MODELS
@@ -486,28 +488,28 @@ class WillhabenScraper:
                 date_part = explicit_pattern.group(1)
                 time_part = explicit_pattern.group(2) or '00:00'
                 dt_local = datetime.strptime(f"{date_part} {time_part}", "%d.%m.%Y %H:%M")
-                return CET.localize(dt_local).replace(tzinfo=None)
+                return (CET.localize(dt_local) + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
             lowered = cleaned.lower()
 
             if 'vor' in lowered:
                 rel_match = re.search(r'vor\s+(\d+)\s+minute[n]?', lowered)
                 if rel_match:
-                    return (now_local - timedelta(minutes=int(rel_match.group(1)))).replace(tzinfo=None)
+                    return (now_local - timedelta(minutes=int(rel_match.group(1))) + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
                 rel_match = re.search(r'vor\s+(\d+)\s+stunde[n]?', lowered)
                 if rel_match:
-                    return (now_local - timedelta(hours=int(rel_match.group(1)))).replace(tzinfo=None)
+                    return (now_local - timedelta(hours=int(rel_match.group(1))) + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
                 rel_match = re.search(r'vor\s+(\d+)\s+tag[en]?', lowered)
                 if rel_match:
-                    return (now_local - timedelta(days=int(rel_match.group(1)))).replace(tzinfo=None)
+                    return (now_local - timedelta(days=int(rel_match.group(1))) + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
             if 'heute' in lowered:
-                return now_local.replace(tzinfo=None)
+                return (now_local + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
             if 'gestern' in lowered:
-                return (now_local - timedelta(days=1)).replace(tzinfo=None)
+                return (now_local - timedelta(days=1) + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
             fallback_pattern = re.search(
                 r'(\d{1,2})\.(\d{1,2})\.(\d{4})(?:,\s*(\d{1,2}:\d{2}))?',
@@ -517,7 +519,7 @@ class WillhabenScraper:
                 day, month, year = map(int, fallback_pattern.group(1, 2, 3))
                 time_part = fallback_pattern.group(4) or '00:00'
                 dt_local = datetime.strptime(f"{day:02d}.{month:02d}.{year:04d} {time_part}", "%d.%m.%Y %H:%M")
-                return CET.localize(dt_local).replace(tzinfo=None)
+                return (CET.localize(dt_local) + POSTED_AT_HARD_OFFSET).replace(tzinfo=None)
 
         except Exception as e:
             logger.debug(f"Error parsing posted date: {e}")
