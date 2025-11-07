@@ -46,8 +46,8 @@ db = SQLAlchemy(app)
 CET = pytz.timezone('Europe/Vienna')
 
 # Fast scrape configuration
-FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '150'))
-FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '10'))
+FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '40'))
+FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '4'))
 POSTED_AT_HARD_OFFSET_HOURS = int(os.getenv('POSTED_AT_HARD_OFFSET_HOURS', '1'))
 POSTED_AT_HARD_OFFSET = timedelta(hours=POSTED_AT_HARD_OFFSET_HOURS)
 
@@ -125,7 +125,11 @@ class ScrapingLog(db.Model):
 class WillhabenScraper:
     """Scraper for willhaben.at car listings - Simplified robust version"""
     
-    BASE_URL = "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?rows=30"
+    BASE_URL = (
+        "https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse"
+        "?sfId=7d143874-1761-4044-a218-11dff1e99ccf"
+        "&rows=30&isNavigation=true&DEALER=1&PRICE_TO=12000&page=1"
+    )
     
     def __init__(self, max_cars: int = 100, full_image_scraping: bool = False):
         self.max_cars = max_cars
@@ -154,11 +158,11 @@ class WillhabenScraper:
                 page = context.new_page()
                 
                 logger.info(f"Navigating to {self.BASE_URL}")
-                page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=60000)
+                page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=45000)
 
                 # Handle cookie consent - try multiple selectors
                 try:
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1200)
                     cookie_selectors = [
                         'button#didomi-notice-agree-button',
                         'button[data-testid="uc-accept-all-button"]',
@@ -179,13 +183,13 @@ class WillhabenScraper:
                     logger.info(f"No cookie dialog or already accepted: {e}")
 
                 # Wait for page to fully load - reduced for speed
-                page.wait_for_timeout(3000)  # Wait 3 seconds for initial load
+                page.wait_for_timeout(1500)  # Quick wait for initial load
                 
                 # Scroll to trigger lazy loading - reduced for speed
                 logger.info("Scrolling to load content...")
-                for i in range(2):  # Minimal scrolling for speed
+                for _ in range(1):
                     page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(500)
 
                 # Try multiple strategies to find car listings
                 logger.info("Looking for car listings...")
