@@ -47,7 +47,7 @@ CET = pytz.timezone('Europe/Vienna')
 
 # Fast scrape configuration
 FAST_SCRAPE_MAX_CARS = int(os.getenv('FAST_SCRAPE_MAX_CARS', '40'))
-FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '4'))
+FAST_SCRAPE_INTERVAL_SECONDS = int(os.getenv('FAST_SCRAPE_INTERVAL_SECONDS', '2'))
 POSTED_AT_HARD_OFFSET_HOURS = int(os.getenv('POSTED_AT_HARD_OFFSET_HOURS', '1'))
 POSTED_AT_HARD_OFFSET = timedelta(hours=POSTED_AT_HARD_OFFSET_HOURS)
 
@@ -1114,7 +1114,7 @@ def init_scheduler():
     """Initialize APScheduler with background jobs"""
     scheduler = BackgroundScheduler(timezone='UTC')
     
-    # STAGE 1: Fast scraping - thumbnails only (every 5 seconds)
+    # STAGE 1: Fast scraping - thumbnails only (every 2 seconds by default)
     scheduler.add_job(
         func=scrape_and_store_cars,
         trigger=IntervalTrigger(seconds=FAST_SCRAPE_INTERVAL_SECONDS),
